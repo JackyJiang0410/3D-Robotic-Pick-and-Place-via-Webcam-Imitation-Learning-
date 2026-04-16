@@ -1,3 +1,6 @@
 mediapipe
 opencv-python
 numpy
+mujoco
+glfw
+zarr

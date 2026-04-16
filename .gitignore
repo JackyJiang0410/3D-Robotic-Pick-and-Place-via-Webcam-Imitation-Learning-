@@ -39,6 +39,10 @@ data/
 stage1_sensory_input/models/
 *.zarr
 *.zarr.zip
+*.npz
+
+# Local vendored downloads / temp
+assets/_vendor/
 
 # Logs
 *.log

@@ -1,82 +1,132 @@
-# Stage 1: Webcam -> MediaPipe -> `[x, y, z, g]`
+# Webcam gesture teleoperation → MuJoCo (Franka Panda) → Zarr demos → behavior cloning (sim-only)
 
-This repository currently implements **Stage 1** of your pipeline:
+This repository implements a **minimal sim-only imitation-learning pipeline**:
 
-`Laptop Webcam -> MediaPipe Hand Tracking -> Extract low-dimensional control signal [x, y, z, g]`.
+1. **Stage 1**: webcam → MediaPipe → low-dimensional hand signal `[x, y, z, g]`
+2. **Stage 2 (Phase 1)**: MuJoCo Franka Panda pick/place scene → teleoperation → dataset logging
+3. **Training**: ridge-regression behavior cloning from Zarr
+4. **Evaluation**: run the learned policy in MuJoCo
 
-## What is implemented
+## Requirements
 
-- Real-time webcam capture (`OpenCV`)
-- Hand keypoint tracking (`MediaPipe Hands`)
-- Action abstraction:
-  - `x`: horizontal wrist position (normalized to `[-1, 1]`)
-  - `y`: vertical wrist position (normalized to `[-1, 1]`)
-  - `z`: depth proxy from palm scale change (normalized and clipped)
-  - `g`: gripper command (`1.0` for pinch/close, `0.0` for open)
-- Temporal smoothing for stable control
-- JSON streaming output for downstream modules
-- Optional visualization window with landmarks and live signal
-- Works with both MediaPipe APIs:
-  - legacy `mp.solutions` (older versions)
-  - newer `mediapipe.tasks` (e.g. Python 3.12 environment)
+- **Python**: 3.10+ recommended (matches common `mediapipe` wheels)
+- **OS**: macOS is supported; some MuJoCo viewer paths require `mjpython`
+- **Hardware**: laptop webcam
 
-## Install
+### Python packages
+
+Install from `requirements.txt`:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-## Run Stage 1
+Key dependencies:
+
+- `mediapipe`, `opencv-python`, `numpy`
+- `mujoco`, `glfw`, `zarr`
+
+## Robot assets (Franka Panda / MuJoCo Menagerie)
+
+This repository **vendors** the MuJoCo Menagerie Franka Panda model at:
+
+- `assets/robots/mujoco_menagerie/franka_emika_panda/`
+
+This is intentional so collaborators can run the project **without a separate download step**.
+
+### Mesh files
+
+Menagerie ships meshes under `franka_emika_panda/assets/`. This repository also keeps the same mesh files at the `franka_emika_panda/` top level so MuJoCo can resolve mesh filenames when `panda.xml` is included from `assets/mujoco/panda_pick_place_scene.xml`.
+
+If you refresh Menagerie from upstream, re-copy meshes if needed:
 
 ```bash
-python run_stage1.py
+cp -n assets/robots/mujoco_menagerie/franka_emika_panda/assets/* assets/robots/mujoco_menagerie/franka_emika_panda/
 ```
 
-On first run with the newer `mediapipe.tasks` backend, the hand-landmarker model file is downloaded automatically and cached under `stage1_sensory_input/models/`.
+### Optional: refresh Menagerie from GitHub
 
-Options:
-
-- `--camera-id`: webcam index (default `0`)
-- `--width`, `--height`: capture size
-- `--pinch-threshold`: pinch ratio threshold for `g`
-- `--print-hz`: max JSON print rate
-- `--no-preview`: headless mode (no OpenCV window)
-- `--out`: optional JSONL output path (append mode)
-- `--max-seconds`: optional auto-stop duration in seconds
-
-Example:
+If you prefer to update the Panda files from source instead of using the vendored copy:
 
 ```bash
-python run_stage1.py --camera-id 0 --width 1280 --height 720 --pinch-threshold 0.4
+mkdir -p assets/robots && cd assets/robots
+git clone --filter=blob:none --sparse https://github.com/google-deepmind/mujoco_menagerie.git mujoco_menagerie
+cd mujoco_menagerie
+git sparse-checkout set franka_emika_panda
 ```
 
-Save to file for 30 seconds:
+### Licensing
+
+Menagerie models have their own license files inside `franka_emika_panda/` (see `LICENSE` there).
+
+## Stage 1: webcam → `[x, y, z, g]`
 
 ```bash
-python run_stage1.py --out data/stage1_signals.jsonl --max-seconds 30
+python run_stage1.py --camera-id 0 --width 1280 --height 720
 ```
 
-## Output format
+`z` is configurable in code via `Stage1Config.z_mode` (defaults to `mp_z_spread` in `stage1_sensory_input/extractor.py`).
 
-The script prints JSON records such as:
+Outputs JSON lines to stdout; optional JSONL logging:
 
-```json
-{"x": -0.12, "y": 0.31, "z": -0.08, "g": 1.0, "t": 1776181275.215}
+```bash
+python run_stage1.py --out data/stage1.jsonl --max-seconds 30
 ```
 
-- `x, y, z, g` are your extracted action vector
-- `t` is timestamp (seconds)
-- with `--out`, each JSON object is also appended to a `.jsonl` file (one record per line)
+`data/` is ignored by git (see `.gitignore`).
 
-## Integration point for Stage 2
+## Phase 1: collect demonstrations (teleop) → Zarr
 
-Use `stage1_sensory_input.Stage1Extractor` in your Data Collection loop:
+This records tuples `(observation, action, time)` where:
 
-1. Read frame from webcam.
-2. Call `process_frame(frame)`.
-3. If signal exists, read `signal.as_vector()` to get `[x, y, z, g]`.
-4. Feed that vector into MuJoCo as demonstration action.
+- **Observation** is a low-dimensional vector from MuJoCo state (joints/velocities + selected poses)
+- **Action** is **`[dx, dy, dz, g]`** (end-effector delta command + grip)
 
-This cleanly bridges your **Sensory Input** stage into **Data Collection**.
+Run:
+
+```bash
+mjpython run_collect_phase1.py --viewer --preview --camera-id 0 --seconds 120 --dataset data/phase1_panda_demos.zarr
+```
+
+Useful flags:
+
+- `--delta-scale`: scales `dx, dy` from hand `x, y`
+- `--z-scale`: scales `dz` from hand `z` (defaults to `--delta-scale` if omitted)
+- `--z-mode`: `palm_scale | mp_z_spread | mp_z_wrist | reach_2d`
+- `--print-hz`: terminal print rate
+- `--verbose-numbers`: print numeric `x,y,z` and `dx,dy,dz` in addition to compact summaries
+- `--preview`: OpenCV webcam window (may conflict with MuJoCo viewer on some macOS setups)
+
+Quit preview window: press `q` in the OpenCV window.
+
+## Train behavior cloning (ridge regression)
+
+```bash
+python run_train_bc_phase1.py --dataset data/phase1_panda_demos.zarr --out data/phase1_panda_bc_policy.npz
+```
+
+## Evaluate the policy in MuJoCo
+
+```bash
+mjpython run_eval_bc_phase1.py --viewer --policy data/phase1_panda_bc_policy.npz --seconds 30
+```
+
+## Optional: Panda-only viewer
+
+```bash
+mjpython run_view_panda.py
+```
+
+## Repository layout (high level)
+
+- `run_stage1.py`: Stage 1 runner
+- `stage1_sensory_input/`: Stage 1 implementation
+- `assets/mujoco/panda_pick_place_scene.xml`: Panda pick/place scene
+- `assets/robots/mujoco_menagerie/franka_emika_panda/`: Menagerie Panda MJCF + meshes
+- `stage2_mujoco/`: MuJoCo environment + Zarr logger
+- `run_collect_phase1.py`, `run_train_bc_phase1.py`, `run_eval_bc_phase1.py`: Phase 1 scripts
+
+## Notes
+
+- **Camera permissions**: macOS must allow camera access for the terminal app running Python.
+- **Dataset size**: Zarr datasets can be large; keep them under `data/` (gitignored) or use Git LFS if you intentionally version data.

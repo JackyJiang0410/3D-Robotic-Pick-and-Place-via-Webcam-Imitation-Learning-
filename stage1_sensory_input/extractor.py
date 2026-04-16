@@ -23,6 +23,12 @@ class Stage1Config:
     pinch_threshold: float = 0.42
     smoothing_alpha: float = 0.35
     max_depth_magnitude: float = 1.0
+    # How to derive the teleop "z" channel from a monocular hand track.
+    # - palm_scale: legacy depth proxy from palm apparent size (noisy for in/out motion)
+    # - mp_z_spread: uses MediaPipe landmark z spread (thumb-index vs wrist), often better for reach
+    # - mp_z_wrist: uses wrist landmark z vs a slow reference (works if z is non-degenerate)
+    # - reach_2d: 2D-only proxy from wrist-to-fingertip reach in the image plane
+    z_mode: str = "mp_z_spread"
     model_asset_path: Optional[str] = None
     model_download_url: str = (
         "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -49,7 +55,7 @@ class Stage1Extractor:
     Stage 1: Laptop Webcam -> MediaPipe -> Extract [x, y, z, g].
 
     - x, y: wrist-centered image position in [-1, 1]
-    - z: depth proxy from relative palm scale change
+    - z: depth / reach proxy (see Stage1Config.z_mode)
     - g: gripper command from pinch gesture (1 close, 0 open)
     """
 
@@ -59,36 +65,47 @@ class Stage1Extractor:
         self._task_timestamp_ms = 0
 
         if self._backend == "solutions":
-            self._mp_hands = mp.solutions.hands
-            self._hands = self._mp_hands.Hands(
-                static_image_mode=False,
-                max_num_hands=config.max_num_hands,
-                min_detection_confidence=config.min_detection_confidence,
-                min_tracking_confidence=config.min_tracking_confidence,
-            )
-            self._drawer = mp.solutions.drawing_utils
-            self._task_hand_landmarker = None
+            self._init_solutions_backend()
         else:
             from mediapipe.tasks import python as mp_tasks_python
             from mediapipe.tasks.python import vision as mp_tasks_vision
 
-            model_path = self._ensure_task_model()
-            base_options = mp_tasks_python.BaseOptions(model_asset_path=str(model_path))
-            options = mp_tasks_vision.HandLandmarkerOptions(
-                base_options=base_options,
-                num_hands=config.max_num_hands,
-                min_hand_detection_confidence=config.min_detection_confidence,
-                min_hand_presence_confidence=config.min_tracking_confidence,
-                min_tracking_confidence=config.min_tracking_confidence,
-                running_mode=mp_tasks_vision.RunningMode.VIDEO,
-            )
-            self._task_hand_landmarker = mp_tasks_vision.HandLandmarker.create_from_options(options)
-            self._mp_hands = None
-            self._hands = None
-            self._drawer = None
+            try:
+                model_path = self._ensure_task_model()
+                base_options = mp_tasks_python.BaseOptions(model_asset_path=str(model_path))
+                options = mp_tasks_vision.HandLandmarkerOptions(
+                    base_options=base_options,
+                    num_hands=config.max_num_hands,
+                    min_hand_detection_confidence=config.min_detection_confidence,
+                    min_hand_presence_confidence=config.min_tracking_confidence,
+                    min_tracking_confidence=config.min_tracking_confidence,
+                    running_mode=mp_tasks_vision.RunningMode.VIDEO,
+                )
+                self._task_hand_landmarker = mp_tasks_vision.HandLandmarker.create_from_options(options)
+                self._mp_hands = None
+                self._hands = None
+                self._drawer = None
+            except Exception:
+                # Some macOS/OpenGL configurations fail to initialize the task backend.
+                # Fall back to the legacy CPU-oriented solution so the teleop loop still runs.
+                self._backend = "solutions"
+                self._init_solutions_backend()
 
         self._prev_xyzg: Optional[np.ndarray] = None
         self._depth_reference: Optional[float] = None
+        self._z_signal_reference: Optional[float] = None
+        self._reach_reference: Optional[float] = None
+
+    def _init_solutions_backend(self) -> None:
+        self._mp_hands = mp.solutions.hands
+        self._hands = self._mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=self.config.max_num_hands,
+            min_detection_confidence=self.config.min_detection_confidence,
+            min_tracking_confidence=self.config.min_tracking_confidence,
+        )
+        self._drawer = mp.solutions.drawing_utils
+        self._task_hand_landmarker = None
 
     @staticmethod
     def _landmark_xy(landmarks, index: int) -> np.ndarray:
@@ -97,6 +114,16 @@ class Stage1Extractor:
         else:
             p = landmarks[index]
         return np.array([p.x, p.y], dtype=np.float32)
+
+    @staticmethod
+    def _landmark_xyz(landmarks, index: int) -> np.ndarray:
+        if hasattr(landmarks, "landmark"):
+            p = landmarks.landmark[index]
+        else:
+            p = landmarks[index]
+        z = float(getattr(p, "z", 0.0))
+        xy = Stage1Extractor._landmark_xy(landmarks, index)
+        return np.array([xy[0], xy[1], z], dtype=np.float32)
 
     def _ensure_task_model(self) -> Path:
         if self.config.model_asset_path:
@@ -145,13 +172,43 @@ class Stage1Extractor:
         palm_length = max(self._distance(wrist, middle_mcp), 1e-6)
         palm_scale = 0.5 * (palm_width + palm_length)
 
-        if self._depth_reference is None:
-            self._depth_reference = palm_scale
+        mode = (self.config.z_mode or "palm_scale").lower()
+        if mode == "palm_scale":
+            if self._depth_reference is None:
+                self._depth_reference = palm_scale
+            else:
+                self._depth_reference = 0.98 * self._depth_reference + 0.02 * palm_scale
+            z_raw = (self._depth_reference - palm_scale) / max(self._depth_reference, 1e-6)
+        elif mode == "mp_z_spread":
+            w = self._landmark_xyz(landmarks, 0)
+            tt = self._landmark_xyz(landmarks, 4)
+            it = self._landmark_xyz(landmarks, 8)
+            # Relative depth cues: fingertip z minus wrist z (hand model coords).
+            spread = float((tt[2] - w[2]) + (it[2] - w[2])) * 0.5
+            if self._z_signal_reference is None:
+                self._z_signal_reference = spread
+            else:
+                self._z_signal_reference = 0.98 * self._z_signal_reference + 0.02 * spread
+            denom = max(abs(self._z_signal_reference), 1e-3)
+            z_raw = (spread - self._z_signal_reference) / denom
+        elif mode == "mp_z_wrist":
+            wz = float(self._landmark_xyz(landmarks, 0)[2])
+            if self._z_signal_reference is None:
+                self._z_signal_reference = wz
+            else:
+                self._z_signal_reference = 0.98 * self._z_signal_reference + 0.02 * wz
+            denom = max(abs(self._z_signal_reference), 1e-3)
+            z_raw = (wz - self._z_signal_reference) / denom
+        elif mode == "reach_2d":
+            reach = float(self._distance(wrist, index_tip) / max(palm_scale, 1e-6))
+            if self._reach_reference is None:
+                self._reach_reference = reach
+            else:
+                self._reach_reference = 0.98 * self._reach_reference + 0.02 * reach
+            z_raw = (reach - self._reach_reference) / max(self._reach_reference, 1e-6)
         else:
-            # Slowly adapt reference for robust long-running sessions.
-            self._depth_reference = 0.98 * self._depth_reference + 0.02 * palm_scale
+            raise ValueError(f"Unknown z_mode: {self.config.z_mode!r}")
 
-        z_raw = (self._depth_reference - palm_scale) / max(self._depth_reference, 1e-6)
         z = float(np.clip(z_raw, -self.config.max_depth_magnitude, self.config.max_depth_magnitude))
 
         pinch_dist = self._distance(thumb_tip, index_tip)
@@ -177,6 +234,9 @@ class Stage1Extractor:
                 )
             else:
                 self._prev_xyzg = None
+                self._depth_reference = None
+                self._z_signal_reference = None
+                self._reach_reference = None
         else:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -192,6 +252,9 @@ class Stage1Extractor:
                 self._draw_task_landmarks(frame_bgr, hand_landmarks)
             else:
                 self._prev_xyzg = None
+                self._depth_reference = None
+                self._z_signal_reference = None
+                self._reach_reference = None
 
         return frame_bgr, signal
 
