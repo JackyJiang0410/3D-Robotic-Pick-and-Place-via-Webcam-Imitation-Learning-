@@ -35,6 +35,7 @@ htmlcov/
 .idea/
 
 # Local model/data artifacts
+data/
 stage1_sensory_input/models/
 *.zarr
 *.zarr.zip

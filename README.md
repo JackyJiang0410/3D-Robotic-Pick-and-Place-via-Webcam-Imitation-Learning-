@@ -43,11 +43,19 @@ Options:
 - `--pinch-threshold`: pinch ratio threshold for `g`
 - `--print-hz`: max JSON print rate
 - `--no-preview`: headless mode (no OpenCV window)
+- `--out`: optional JSONL output path (append mode)
+- `--max-seconds`: optional auto-stop duration in seconds
 
 Example:
 
 ```bash
 python run_stage1.py --camera-id 0 --width 1280 --height 720 --pinch-threshold 0.4
+```
+
+Save to file for 30 seconds:
+
+```bash
+python run_stage1.py --out data/stage1_signals.jsonl --max-seconds 30
 ```
 
 ## Output format
@@ -60,6 +68,7 @@ The script prints JSON records such as:
 
 - `x, y, z, g` are your extracted action vector
 - `t` is timestamp (seconds)
+- with `--out`, each JSON object is also appended to a `.jsonl` file (one record per line)
 
 ## Integration point for Stage 2
 

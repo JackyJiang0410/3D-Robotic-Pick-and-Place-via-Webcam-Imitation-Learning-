@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from pathlib import Path
 
 import cv2
 
@@ -26,6 +27,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run without OpenCV preview window.",
     )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Optional output JSONL path for extracted signals.",
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Optional auto-stop duration in seconds.",
+    )
     return parser.parse_args()
 
 
@@ -39,9 +52,18 @@ def main() -> None:
     )
     extractor = Stage1Extractor(config)
     cap = extractor.open_camera()
+    start_t = time.time()
+
+    out_file = None
+    if args.out:
+        out_path = Path(args.out).expanduser().resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_file = out_path.open("a", encoding="utf-8")
 
     print("Stage 1 started. Press 'q' in preview window to quit.")
     print("Output schema: {'x': float, 'y': float, 'z': float, 'g': float, 't': float}")
+    if out_file is not None:
+        print(f"Saving JSONL output to: {out_file.name}")
 
     last_print_t = 0.0
     min_print_dt = 1.0 / max(args.print_hz, 1e-6)
@@ -54,6 +76,9 @@ def main() -> None:
 
             vis, signal = extractor.process_frame(frame)
             now = time.time()
+            if args.max_seconds is not None and (now - start_t) >= args.max_seconds:
+                print(f"Reached --max-seconds={args.max_seconds}; exiting.")
+                break
 
             if signal is not None and (now - last_print_t) >= min_print_dt:
                 payload = {
@@ -63,7 +88,11 @@ def main() -> None:
                     "g": round(signal.g, 1),
                     "t": round(signal.timestamp, 3),
                 }
-                print(json.dumps(payload))
+                payload_json = json.dumps(payload)
+                print(payload_json)
+                if out_file is not None:
+                    out_file.write(payload_json + "\n")
+                    out_file.flush()
                 last_print_t = now
 
             if not args.no_preview:
@@ -86,6 +115,8 @@ def main() -> None:
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
     finally:
+        if out_file is not None:
+            out_file.close()
         cap.release()
         extractor.close()
         cv2.destroyAllWindows()
