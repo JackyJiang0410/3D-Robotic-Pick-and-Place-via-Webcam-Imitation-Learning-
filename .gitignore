@@ -1,0 +1,43 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Editors / IDE
+.vscode/
+.idea/
+
+# Local model/data artifacts
+stage1_sensory_input/models/
+*.zarr
+*.zarr.zip
+
+# Logs
+*.log
