@@ -87,6 +87,11 @@ Run:
 ```bash
 mjpython run_collect_phase1.py --viewer --preview --camera-id 0 --seconds 120 --dataset data/phase1_panda_demos.zarr
 ```
+OR without saving data:
+
+```bash
+mjpython run_collect_phase1.py --viewer --no-log
+```
 
 Useful flags:
 
