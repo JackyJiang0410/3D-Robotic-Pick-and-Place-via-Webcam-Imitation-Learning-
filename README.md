@@ -98,6 +98,17 @@ Useful flags:
 - `--verbose-numbers`: print numeric `x,y` and `dx,dy` in addition to compact summaries
 - `--preview`: OpenCV webcam window (may conflict with MuJoCo viewer on some macOS setups)
 
+During collection, a **pinch rising edge** (open -> close) triggers an automatic macro:
+
+`descend -> close -> lift -> lower -> open -> retreat`
+
+This lets you teleoperate only `x,y` and use pinch as the event trigger to test whether the robot can complete a grasp cycle in simulation.
+
+You can make the macro slower/smoother with:
+
+- `--auto-time-scale` (e.g. `2.0` or `3.0` for slower motion)
+- `--auto-ease smoothstep` (default) for ease-in/ease-out interpolation
+
 Quit preview window: press `q` in the OpenCV window.
 
 ## Train behavior cloning (ridge regression)

@@ -110,6 +110,23 @@ class PandaPickPlaceEnv:
     def action_dim(self) -> int:
         return 3
 
+    @property
+    def workspace_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.workspace_min.copy(), self.workspace_max.copy()
+
+    @property
+    def ee_target(self) -> np.ndarray:
+        return self._ee_target.copy()
+
+    def set_ee_target(self, target_xyz: np.ndarray) -> None:
+        target = np.asarray(target_xyz, dtype=np.float32).reshape(3)
+        self._ee_target = np.clip(target, self.workspace_min, self.workspace_max)
+
+    def set_ee_target_z(self, target_z: float) -> None:
+        t = self._ee_target.copy()
+        t[2] = float(target_z)
+        self.set_ee_target(t)
+
     def reset(self, seed: Optional[int] = None) -> PandaObs:
         if seed is not None:
             np.random.seed(seed)

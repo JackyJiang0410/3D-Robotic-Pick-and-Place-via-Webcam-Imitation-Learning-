@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -43,6 +44,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also print numeric x,y and dx,dy (default is compact plain-language).",
     )
+    p.add_argument(
+        "--auto-time-scale",
+        type=float,
+        default=2.0,
+        help="Slow down auto pick-place sequence by this multiplier (>=1 is slower).",
+    )
+    p.add_argument(
+        "--auto-ease",
+        type=str,
+        default="smoothstep",
+        choices=["linear", "smoothstep"],
+        help="Interpolation profile for auto sequence motion.",
+    )
     return p.parse_args()
 
 
@@ -78,18 +92,101 @@ def _format_cmd(dx: float, dy: float, g_cmd: float, scales: Tuple[float, float])
     return f"cmd={motion} | grip={grip}"
 
 
+@dataclass
+class AutoPickPlaceSequence:
+    start_t: float
+    hover_z: float
+    grasp_z: float
+    lift_z: float
+    place_z: float
+    phase_name: str = "descend"
+    phase_idx: int = 0
+    phase_start_t: float = 0.0
+    success_lifted: bool = False
+    time_scale: float = 2.0
+    ease_mode: str = "smoothstep"
+
+    # (name, duration_sec)
+    PHASES = [
+        ("descend", 0.7),
+        ("close", 0.35),
+        ("lift", 0.8),
+        ("lower", 0.8),
+        ("open", 0.35),
+        ("retreat", 0.6),
+        ("settle", 0.35),
+    ]
+
+    def __post_init__(self) -> None:
+        self.phase_start_t = self.start_t
+        self.phase_name = self.PHASES[0][0]
+
+    def _interp(self, a: float, b: float, alpha: float) -> float:
+        return (1.0 - alpha) * a + alpha * b
+
+    def _ease(self, alpha: float) -> float:
+        a = float(np.clip(alpha, 0.0, 1.0))
+        if self.ease_mode == "linear":
+            return a
+        # smoothstep: 3a^2 - 2a^3
+        return a * a * (3.0 - 2.0 * a)
+
+    def step(self, env: PandaPickPlaceEnv, now: float, obs) -> tuple[np.ndarray, bool]:
+        name, base_dur = self.PHASES[self.phase_idx]
+        dur = max(base_dur * max(self.time_scale, 0.1), 1e-3)
+        elapsed = now - self.phase_start_t
+        alpha = float(np.clip(elapsed / max(dur, 1e-6), 0.0, 1.0))
+        alpha_eased = self._ease(alpha)
+
+        if name == "descend":
+            env.set_ee_target_z(self._interp(self.hover_z, self.grasp_z, alpha_eased))
+            act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        elif name == "close":
+            env.set_ee_target_z(self.grasp_z)
+            act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        elif name == "lift":
+            env.set_ee_target_z(self._interp(self.grasp_z, self.lift_z, alpha_eased))
+            act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            if float(obs.obj_pos[2]) > (self.grasp_z + 0.03):
+                self.success_lifted = True
+        elif name == "lower":
+            env.set_ee_target_z(self._interp(self.lift_z, self.place_z, alpha_eased))
+            act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        elif name == "open":
+            env.set_ee_target_z(self.place_z)
+            act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        elif name == "retreat":
+            env.set_ee_target_z(self._interp(self.place_z, self.hover_z, alpha_eased))
+            act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        else:  # settle
+            env.set_ee_target_z(self.hover_z)
+            act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
+        if elapsed >= dur:
+            self.phase_idx += 1
+            if self.phase_idx >= len(self.PHASES):
+                return act, True
+            self.phase_name = self.PHASES[self.phase_idx][0]
+            self.phase_start_t = now
+
+        return act, False
+
+
 def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespace) -> None:
     extractor = Stage1Extractor(Stage1Config(camera_id=args.camera_id))
     cap = extractor.open_camera()
 
     logger = ZarrTrajectoryLogger(args.dataset)
     obs0 = env.reset(seed=args.seed)
+    obs = obs0
     ep = logger.start_episode(obs_dim=obs0.as_vector().shape[0], act_dim=env.action_dim, name=args.episode_name)
     start = time.time()
     end = start + args.seconds
     last_print = 0.0
     min_print_dt = 1.0 / max(args.print_hz, 1e-6)
     hand_seen_once = False
+    last_g_state = 0.0
+    auto_seq: Optional[AutoPickPlaceSequence] = None
 
     print(f"Writing dataset to: {Path(args.dataset).expanduser().resolve()}")
     print(f"Episode: {ep.group.name}  (press Ctrl+C to stop early)")
@@ -101,17 +198,56 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
     print("  Pinch fingers    : g=1 -> CLOSE gripper")
     print("  Open fingers     : g=0 -> OPEN gripper")
     print("Tips: keep one hand centered in camera, move slowly, adjust --delta-scale.")
+    print("Auto sequence: pinch edge triggers descend -> close -> lift -> lower -> open -> retreat.")
+    print(f"Auto timing: --auto-time-scale={args.auto_time_scale}  easing={args.auto_ease}")
     if args.preview and viewer is not None:
         print("NOTE: --preview + MuJoCo viewer can crash OpenCV on some macOS setups. If it crashes, omit --preview.")
 
     try:
         while time.time() < end:
+            now = time.time()
             ok, frame = cap.read()
             if not ok:
                 raise RuntimeError("Failed to read frame from webcam.")
 
             vis, signal = extractor.process_frame(frame)
+
             if signal is not None:
+                g_rise = (last_g_state <= 0.5) and (signal.g > 0.5)
+                last_g_state = signal.g
+            else:
+                g_rise = False
+                last_g_state = 0.0
+
+            if auto_seq is None and g_rise:
+                ws_min, ws_max = env.workspace_bounds
+                ee_t = env.ee_target
+                hover_z = float(ee_t[2])
+                # Keep safe margins from table and workspace bounds.
+                grasp_z = float(np.clip(obs.obj_pos[2] + 0.02, ws_min[2] + 0.01, ws_max[2] - 0.05))
+                lift_z = float(np.clip(max(hover_z, grasp_z) + 0.12, ws_min[2] + 0.05, ws_max[2] - 0.02))
+                place_z = grasp_z
+                auto_seq = AutoPickPlaceSequence(
+                    start_t=now,
+                    hover_z=hover_z,
+                    grasp_z=grasp_z,
+                    lift_z=lift_z,
+                    place_z=place_z,
+                    time_scale=float(args.auto_time_scale),
+                    ease_mode=str(args.auto_ease),
+                )
+                print(
+                    f"[AUTO] Triggered: hover_z={hover_z:.3f} grasp_z={grasp_z:.3f} "
+                    f"lift_z={lift_z:.3f}"
+                )
+
+            if auto_seq is not None:
+                act, done = auto_seq.step(env, now, obs)
+                if done:
+                    seq_success = auto_seq.success_lifted
+                    print(f"[AUTO] Completed sequence. success_lifted={seq_success}")
+                    auto_seq = None
+            elif signal is not None:
                 act = gesture_to_dxdyg(signal.as_vector(), args.delta_scale)
             else:
                 act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -129,7 +265,10 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                     hud = "No hand"
                 else:
                     pinch = "PINCH" if signal.g > 0.5 else "OPEN"
-                    hud = f"{cmd_txt} | hand {pinch}"
+                    if auto_seq is not None:
+                        hud = f"{cmd_txt} | hand {pinch} | AUTO:{auto_seq.phase_name}"
+                    else:
+                        hud = f"{cmd_txt} | hand {pinch}"
                 cv2.putText(vis, hud, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
                 try:
                     cv2.imshow("Webcam (teleop)", vis)
@@ -156,6 +295,8 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                             f" | hand_xyg=({signal.x:+.2f},{signal.y:+.2f},{signal.g:.0f})"
                             f" | dxy=({act[0]:+.4f},{act[1]:+.4f})"
                         )
+                    if auto_seq is not None:
+                        base += f" | auto_phase={auto_seq.phase_name}"
                     print(base)
                 else:
                     if not hand_seen_once:
