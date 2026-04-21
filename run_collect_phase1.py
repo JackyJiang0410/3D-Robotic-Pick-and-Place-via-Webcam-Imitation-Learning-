@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--auto-time-scale",
         type=float,
-        default=2.0,
+        default=20.0,
         help="Slow down auto pick-place sequence by this multiplier (>=1 is slower).",
     )
     p.add_argument(
@@ -57,12 +57,19 @@ def parse_args() -> argparse.Namespace:
         choices=["linear", "smoothstep"],
         help="Interpolation profile for auto sequence motion.",
     )
+    p.add_argument(
+        "--auto-grasp-offset",
+        type=float,
+        default=0.06,
+        help="Target z above object center during auto descend (meters). Larger means less downward motion.",
+    )
     return p.parse_args()
 
 
 def gesture_to_dxdyg(action_human: np.ndarray, delta_scale: float) -> np.ndarray:
     x, y, g = action_human.astype(np.float32)
-    dx = float(delta_scale * x)
+    # Mirror X so hand-right moves the robot in the opposite world-X direction.
+    dx = float(-delta_scale * x)
     dy = float(-delta_scale * y)
     return np.array([dx, dy, float(g)], dtype=np.float32)
 
@@ -191,15 +198,18 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
     print(f"Writing dataset to: {Path(args.dataset).expanduser().resolve()}")
     print(f"Episode: {ep.group.name}  (press Ctrl+C to stop early)")
     print("Gesture -> Panda action mapping:")
-    print("  Move hand RIGHT  : +x -> +dx (ee moves +X)")
-    print("  Move hand LEFT   : -x -> -dx")
+    print("  Move hand RIGHT  : +x -> -dx (ee moves -X)")
+    print("  Move hand LEFT   : -x -> +dx (ee moves +X)")
     print("  Move hand UP     : -y -> +dy  (dy uses inverted y)")
     print("  Move hand DOWN   : +y -> -dy")
     print("  Pinch fingers    : g=1 -> CLOSE gripper")
     print("  Open fingers     : g=0 -> OPEN gripper")
     print("Tips: keep one hand centered in camera, move slowly, adjust --delta-scale.")
     print("Auto sequence: pinch edge triggers descend -> close -> lift -> lower -> open -> retreat.")
-    print(f"Auto timing: --auto-time-scale={args.auto_time_scale}  easing={args.auto_ease}")
+    print(
+        f"Auto timing: --auto-time-scale={args.auto_time_scale}  easing={args.auto_ease}  "
+        f"--auto-grasp-offset={args.auto_grasp_offset}"
+    )
     if args.preview and viewer is not None:
         print("NOTE: --preview + MuJoCo viewer can crash OpenCV on some macOS setups. If it crashes, omit --preview.")
 
@@ -224,7 +234,13 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                 ee_t = env.ee_target
                 hover_z = float(ee_t[2])
                 # Keep safe margins from table and workspace bounds.
-                grasp_z = float(np.clip(obs.obj_pos[2] + 0.02, ws_min[2] + 0.01, ws_max[2] - 0.05))
+                grasp_z = float(
+                    np.clip(
+                        obs.obj_pos[2] + float(args.auto_grasp_offset),
+                        ws_min[2] + 0.03,
+                        ws_max[2] - 0.05,
+                    )
+                )
                 lift_z = float(np.clip(max(hover_z, grasp_z) + 0.12, ws_min[2] + 0.05, ws_max[2] - 0.02))
                 place_z = grasp_z
                 auto_seq = AutoPickPlaceSequence(

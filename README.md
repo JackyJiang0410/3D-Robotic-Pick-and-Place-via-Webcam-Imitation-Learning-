@@ -106,8 +106,9 @@ This lets you teleoperate only `x,y` and use pinch as the event trigger to test 
 
 You can make the macro slower/smoother with:
 
-- `--auto-time-scale` (e.g. `2.0` or `3.0` for slower motion)
+- `--auto-time-scale` (default `20.0`; larger is slower)
 - `--auto-ease smoothstep` (default) for ease-in/ease-out interpolation
+- `--auto-grasp-offset` (default `0.06`) to keep descend target higher above the object center
 
 Quit preview window: press `q` in the OpenCV window.
 
