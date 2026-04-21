@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--auto-time-scale",
         type=float,
-        default=10.0,
+        default=5.0,
         help="Slow down auto pick-place sequence by this multiplier (>=1 is slower).",
     )
     p.add_argument(
@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--auto-grasp-offset",
         type=float,
-        default=0.10,
+        default=0.01,
         help="Target z above object center during auto descend (meters). Larger means less downward motion.",
     )
     p.add_argument(
@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--auto-table-clearance-z",
         type=float,
-        default=0.11,
+        default=0.015,
         help="Minimum hand-body z above table top during descend to avoid collision.",
     )
     return p.parse_args()
