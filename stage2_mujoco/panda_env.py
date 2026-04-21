@@ -58,7 +58,7 @@ class PandaPickPlaceEnv:
         ik_iters: int = 8,
         workspace_min: tuple[float, float, float] = (0.25, -0.35, 0.15),
         workspace_max: tuple[float, float, float] = (0.85, 0.35, 0.75),
-        ee_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.10),
+        fingertip_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.045),
     ):
         self.model_path = Path(model_path) if model_path else DEFAULT_PANDA_SCENE
         self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
@@ -69,9 +69,11 @@ class PandaPickPlaceEnv:
         self.ik_iters = int(ik_iters)
         self.workspace_min = np.array(workspace_min, dtype=np.float32)
         self.workspace_max = np.array(workspace_max, dtype=np.float32)
-        self._ee_local_offset = np.array(ee_local_offset, dtype=np.float64)
+        self._fingertip_local_offset = np.array(fingertip_local_offset, dtype=np.float64)
 
         self._hand_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
+        self._left_finger_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "left_finger")
+        self._right_finger_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "right_finger")
         self._obj_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "object")
         self._target_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "target_site")
 
@@ -200,23 +202,47 @@ class PandaPickPlaceEnv:
         return self.observe()
 
     def _ee_pos(self) -> np.ndarray:
-        # Track a tool-center-point offset from the hand frame (near gripper center),
-        # not the hand origin, to reduce XY drift during vertical moves.
-        xmat = self.data.xmat[self._hand_body_id].reshape(3, 3)
-        return self.data.xpos[self._hand_body_id] + xmat @ self._ee_local_offset
+        # Use midpoint of left/right fingertip proxy points as TCP.
+        # This better matches visible gripper center than the hand origin.
+        if self._left_finger_body_id >= 0 and self._right_finger_body_id >= 0:
+            p_l = self._body_point_world(self._left_finger_body_id, self._fingertip_local_offset)
+            p_r = self._body_point_world(self._right_finger_body_id, self._fingertip_local_offset)
+            return 0.5 * (p_l + p_r)
 
-    def _ik_track_target(self, target_pos: np.ndarray) -> None:
+        return self.data.xpos[self._hand_body_id]
+
+    def _body_point_world(self, body_id: int, local_offset: np.ndarray) -> np.ndarray:
+        xmat = self.data.xmat[body_id].reshape(3, 3)
+        return self.data.xpos[body_id] + xmat @ local_offset
+
+    def _tcp_jacobian(self) -> np.ndarray:
+        # Jacobian of fingertip midpoint TCP wrt all DoFs.
+        if self._left_finger_body_id >= 0 and self._right_finger_body_id >= 0:
+            jacp_l = np.zeros((3, self.model.nv), dtype=np.float64)
+            jacr_l = np.zeros((3, self.model.nv), dtype=np.float64)
+            jacp_r = np.zeros((3, self.model.nv), dtype=np.float64)
+            jacr_r = np.zeros((3, self.model.nv), dtype=np.float64)
+            p_l = self._body_point_world(self._left_finger_body_id, self._fingertip_local_offset)
+            p_r = self._body_point_world(self._right_finger_body_id, self._fingertip_local_offset)
+            mujoco.mj_jac(self.model, self.data, jacp_l, jacr_l, p_l, self._left_finger_body_id)
+            mujoco.mj_jac(self.model, self.data, jacp_r, jacr_r, p_r, self._right_finger_body_id)
+            return 0.5 * (jacp_l + jacp_r)
+
         jacp = np.zeros((3, self.model.nv), dtype=np.float64)
         jacr = np.zeros((3, self.model.nv), dtype=np.float64)
+        p_h = self.data.xpos[self._hand_body_id]
+        mujoco.mj_jac(self.model, self.data, jacp, jacr, p_h, self._hand_body_id)
+        return jacp
 
+    def _ik_track_target(self, target_pos: np.ndarray) -> None:
         for _ in range(self.ik_iters):
             cur = self._ee_pos().astype(np.float64)
             err = (target_pos.astype(np.float64) - cur)
             if float(np.linalg.norm(err)) < 1e-4:
                 break
 
-            mujoco.mj_jac(self.model, self.data, jacp, jacr, cur, self._hand_body_id)
-            J = jacp[:, self._arm_dof_adr]  # (3,7)
+            J_full = self._tcp_jacobian()
+            J = J_full[:, self._arm_dof_adr]  # (3,7)
 
             # Damped least squares: dq = J^T (J J^T + λI)^-1 * err
             JJt = J @ J.T
