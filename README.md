@@ -100,7 +100,7 @@ Useful flags:
 
 During collection, a **pinch rising edge** (open -> close) triggers an automatic macro:
 
-`descend -> close -> lift -> lower -> open -> retreat`
+`descend -> close -> lift -> return_pre -> move_home -> lower_home -> open -> raise_home -> back_to_pre`
 
 This lets you teleoperate only `x,y` and use pinch as the event trigger to test whether the robot can complete a grasp cycle in simulation.
 
@@ -108,7 +108,8 @@ You can make the macro slower/smoother with:
 
 - `--auto-time-scale` (default `20.0`; larger is slower)
 - `--auto-ease smoothstep` (default) for ease-in/ease-out interpolation
-- `--auto-grasp-offset` (default `0.06`) to keep descend target higher above the object center
+- `--auto-grasp-offset` (default `0.10`) to keep descend target higher above the object center
+- `--auto-table-top-z` and `--auto-table-clearance-z` to enforce a safe minimum hand-body z during descend (prevents table collision)
 
 Quit preview window: press `q` in the OpenCV window.
 

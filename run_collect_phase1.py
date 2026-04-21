@@ -60,8 +60,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--auto-grasp-offset",
         type=float,
-        default=0.06,
+        default=0.10,
         help="Target z above object center during auto descend (meters). Larger means less downward motion.",
+    )
+    p.add_argument(
+        "--auto-table-top-z",
+        type=float,
+        default=0.30,
+        help="Estimated table top z in world frame.",
+    )
+    p.add_argument(
+        "--auto-table-clearance-z",
+        type=float,
+        default=0.11,
+        help="Minimum hand-body z above table top during descend to avoid collision.",
     )
     return p.parse_args()
 
@@ -102,10 +114,13 @@ def _format_cmd(dx: float, dy: float, g_cmd: float, scales: Tuple[float, float])
 @dataclass
 class AutoPickPlaceSequence:
     start_t: float
-    hover_z: float
+    pre_xyz: np.ndarray
+    pre_hover_z: float
+    home_xy: np.ndarray
     grasp_z: float
     lift_z: float
     place_z: float
+    place_xy: np.ndarray
     phase_name: str = "descend"
     phase_idx: int = 0
     phase_start_t: float = 0.0
@@ -118,9 +133,12 @@ class AutoPickPlaceSequence:
         ("descend", 0.7),
         ("close", 0.35),
         ("lift", 0.8),
-        ("lower", 0.8),
+        ("return_pre", 0.9),
+        ("move_home", 1.0),
+        ("lower_home", 0.9),
         ("open", 0.35),
-        ("retreat", 0.6),
+        ("raise_home", 0.8),
+        ("back_to_pre", 1.0),
         ("settle", 0.35),
     ]
 
@@ -129,6 +147,9 @@ class AutoPickPlaceSequence:
         self.phase_name = self.PHASES[0][0]
 
     def _interp(self, a: float, b: float, alpha: float) -> float:
+        return (1.0 - alpha) * a + alpha * b
+
+    def _interp_vec(self, a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarray:
         return (1.0 - alpha) * a + alpha * b
 
     def _ease(self, alpha: float) -> float:
@@ -145,8 +166,13 @@ class AutoPickPlaceSequence:
         alpha = float(np.clip(elapsed / max(dur, 1e-6), 0.0, 1.0))
         alpha_eased = self._ease(alpha)
 
+        pre_hover_xyz = np.array([self.pre_xyz[0], self.pre_xyz[1], self.pre_hover_z], dtype=np.float32)
+        pre_lift_xyz = np.array([self.pre_xyz[0], self.pre_xyz[1], self.lift_z], dtype=np.float32)
+        home_lift_xyz = np.array([self.home_xy[0], self.home_xy[1], self.lift_z], dtype=np.float32)
+        home_place_xyz = np.array([self.home_xy[0], self.home_xy[1], self.place_z], dtype=np.float32)
+
         if name == "descend":
-            env.set_ee_target_z(self._interp(self.hover_z, self.grasp_z, alpha_eased))
+            env.set_ee_target_z(self._interp(self.pre_hover_z, self.grasp_z, alpha_eased))
             act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         elif name == "close":
             env.set_ee_target_z(self.grasp_z)
@@ -156,17 +182,26 @@ class AutoPickPlaceSequence:
             act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
             if float(obs.obj_pos[2]) > (self.grasp_z + 0.03):
                 self.success_lifted = True
-        elif name == "lower":
-            env.set_ee_target_z(self._interp(self.lift_z, self.place_z, alpha_eased))
+        elif name == "return_pre":
+            env.set_ee_target(self._interp_vec(pre_lift_xyz, pre_hover_xyz, alpha_eased))
+            act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        elif name == "move_home":
+            env.set_ee_target(self._interp_vec(pre_hover_xyz, home_lift_xyz, alpha_eased))
+            act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        elif name == "lower_home":
+            env.set_ee_target(self._interp_vec(home_lift_xyz, home_place_xyz, alpha_eased))
             act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         elif name == "open":
-            env.set_ee_target_z(self.place_z)
+            env.set_ee_target(home_place_xyz)
             act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        elif name == "retreat":
-            env.set_ee_target_z(self._interp(self.place_z, self.hover_z, alpha_eased))
+        elif name == "raise_home":
+            env.set_ee_target(self._interp_vec(home_place_xyz, home_lift_xyz, alpha_eased))
+            act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        elif name == "back_to_pre":
+            env.set_ee_target(self._interp_vec(home_lift_xyz, pre_hover_xyz, alpha_eased))
             act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         else:  # settle
-            env.set_ee_target_z(self.hover_z)
+            env.set_ee_target(pre_hover_xyz)
             act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 
         if elapsed >= dur:
@@ -205,10 +240,14 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
     print("  Pinch fingers    : g=1 -> CLOSE gripper")
     print("  Open fingers     : g=0 -> OPEN gripper")
     print("Tips: keep one hand centered in camera, move slowly, adjust --delta-scale.")
-    print("Auto sequence: pinch edge triggers descend -> close -> lift -> lower -> open -> retreat.")
+    print(
+        "Auto sequence: descend -> close -> lift -> return_pre -> move_home -> "
+        "lower_home -> open -> raise_home -> back_to_pre."
+    )
     print(
         f"Auto timing: --auto-time-scale={args.auto_time_scale}  easing={args.auto_ease}  "
-        f"--auto-grasp-offset={args.auto_grasp_offset}"
+        f"--auto-grasp-offset={args.auto_grasp_offset}  "
+        f"table_z={args.auto_table_top_z}+{args.auto_table_clearance_z}"
     )
     if args.preview and viewer is not None:
         print("NOTE: --preview + MuJoCo viewer can crash OpenCV on some macOS setups. If it crashes, omit --preview.")
@@ -232,11 +271,14 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
             if auto_seq is None and g_rise:
                 ws_min, ws_max = env.workspace_bounds
                 ee_t = env.ee_target
+                pre_xyz = ee_t.copy()
+                home_xy = obs0.ee_pos[:2].astype(np.float32).copy()
                 hover_z = float(ee_t[2])
                 # Keep safe margins from table and workspace bounds.
+                table_safe_z = float(args.auto_table_top_z + args.auto_table_clearance_z)
                 grasp_z = float(
                     np.clip(
-                        obs.obj_pos[2] + float(args.auto_grasp_offset),
+                        max(obs.obj_pos[2] + float(args.auto_grasp_offset), table_safe_z),
                         ws_min[2] + 0.03,
                         ws_max[2] - 0.05,
                     )
@@ -245,16 +287,20 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                 place_z = grasp_z
                 auto_seq = AutoPickPlaceSequence(
                     start_t=now,
-                    hover_z=hover_z,
+                    pre_xyz=pre_xyz,
+                    pre_hover_z=hover_z,
+                    home_xy=home_xy,
                     grasp_z=grasp_z,
                     lift_z=lift_z,
                     place_z=place_z,
+                    place_xy=home_xy,
                     time_scale=float(args.auto_time_scale),
                     ease_mode=str(args.auto_ease),
                 )
                 print(
-                    f"[AUTO] Triggered: hover_z={hover_z:.3f} grasp_z={grasp_z:.3f} "
-                    f"lift_z={lift_z:.3f}"
+                    f"[AUTO] Triggered: pre=({pre_xyz[0]:.3f},{pre_xyz[1]:.3f},{hover_z:.3f}) "
+                    f"home_xy=({home_xy[0]:.3f},{home_xy[1]:.3f}) "
+                    f"grasp_z={grasp_z:.3f} lift_z={lift_z:.3f}"
                 )
 
             if auto_seq is not None:
