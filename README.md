@@ -2,7 +2,7 @@
 
 This repository implements a **minimal sim-only imitation-learning pipeline**:
 
-1. **Stage 1**: webcam → MediaPipe → low-dimensional hand signal `[x, y, z, g]`
+1. **Stage 1**: webcam → MediaPipe → low-dimensional hand signal `[x, y, g]`
 2. **Stage 2 (Phase 1)**: MuJoCo Franka Panda pick/place scene → teleoperation → dataset logging
 3. **Training**: ridge-regression behavior cloning from Zarr
 4. **Evaluation**: run the learned policy in MuJoCo
@@ -59,13 +59,11 @@ git sparse-checkout set franka_emika_panda
 
 Menagerie models have their own license files inside `franka_emika_panda/` (see `LICENSE` there).
 
-## Stage 1: webcam → `[x, y, z, g]`
+## Stage 1: webcam → `[x, y, g]`
 
 ```bash
 python run_stage1.py --camera-id 0 --width 1280 --height 720
 ```
-
-`z` is configurable in code via `Stage1Config.z_mode` (defaults to `mp_z_spread` in `stage1_sensory_input/extractor.py`).
 
 Outputs JSON lines to stdout; optional JSONL logging:
 
@@ -80,7 +78,7 @@ python run_stage1.py --out data/stage1.jsonl --max-seconds 30
 This records tuples `(observation, action, time)` where:
 
 - **Observation** is a low-dimensional vector from MuJoCo state (joints/velocities + selected poses)
-- **Action** is **`[dx, dy, dz, g]`** (end-effector delta command + grip)
+- **Action** is **`[dx, dy, g]`** (2D end-effector delta command + grip)
 
 Run:
 
@@ -96,10 +94,8 @@ mjpython run_collect_phase1.py --viewer --no-log
 Useful flags:
 
 - `--delta-scale`: scales `dx, dy` from hand `x, y`
-- `--z-scale`: scales `dz` from hand `z` (defaults to `--delta-scale` if omitted)
-- `--z-mode`: `palm_scale | mp_z_spread | mp_z_wrist | reach_2d`
 - `--print-hz`: terminal print rate
-- `--verbose-numbers`: print numeric `x,y,z` and `dx,dy,dz` in addition to compact summaries
+- `--verbose-numbers`: print numeric `x,y` and `dx,dy` in addition to compact summaries
 - `--preview`: OpenCV webcam window (may conflict with MuJoCo viewer on some macOS setups)
 
 Quit preview window: press `q` in the OpenCV window.

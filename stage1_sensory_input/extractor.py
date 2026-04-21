@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -22,13 +22,6 @@ class Stage1Config:
     min_tracking_confidence: float = 0.6
     pinch_threshold: float = 0.42
     smoothing_alpha: float = 0.35
-    max_depth_magnitude: float = 1.0
-    # How to derive the teleop "z" channel from a monocular hand track.
-    # - palm_scale: legacy depth proxy from palm apparent size (noisy for in/out motion)
-    # - mp_z_spread: uses MediaPipe landmark z spread (thumb-index vs wrist), often better for reach
-    # - mp_z_wrist: uses wrist landmark z vs a slow reference (works if z is non-degenerate)
-    # - reach_2d: 2D-only proxy from wrist-to-fingertip reach in the image plane
-    z_mode: str = "mp_z_spread"
     model_asset_path: Optional[str] = None
     model_download_url: str = (
         "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -40,22 +33,20 @@ class Stage1Config:
 class HandControlSignal:
     x: float
     y: float
-    z: float
     g: float
     timestamp: float
     hand_present: bool
     pinch_ratio: float
 
     def as_vector(self) -> np.ndarray:
-        return np.array([self.x, self.y, self.z, self.g], dtype=np.float32)
+        return np.array([self.x, self.y, self.g], dtype=np.float32)
 
 
 class Stage1Extractor:
     """
-    Stage 1: Laptop Webcam -> MediaPipe -> Extract [x, y, z, g].
+    Stage 1: Laptop Webcam -> MediaPipe -> Extract [x, y, g].
 
     - x, y: wrist-centered image position in [-1, 1]
-    - z: depth / reach proxy (see Stage1Config.z_mode)
     - g: gripper command from pinch gesture (1 close, 0 open)
     """
 
@@ -91,10 +82,7 @@ class Stage1Extractor:
                 self._backend = "solutions"
                 self._init_solutions_backend()
 
-        self._prev_xyzg: Optional[np.ndarray] = None
-        self._depth_reference: Optional[float] = None
-        self._z_signal_reference: Optional[float] = None
-        self._reach_reference: Optional[float] = None
+        self._prev_xyg: Optional[np.ndarray] = None
 
     def _init_solutions_backend(self) -> None:
         self._mp_hands = mp.solutions.hands
@@ -114,16 +102,6 @@ class Stage1Extractor:
         else:
             p = landmarks[index]
         return np.array([p.x, p.y], dtype=np.float32)
-
-    @staticmethod
-    def _landmark_xyz(landmarks, index: int) -> np.ndarray:
-        if hasattr(landmarks, "landmark"):
-            p = landmarks.landmark[index]
-        else:
-            p = landmarks[index]
-        z = float(getattr(p, "z", 0.0))
-        xy = Stage1Extractor._landmark_xy(landmarks, index)
-        return np.array([xy[0], xy[1], z], dtype=np.float32)
 
     def _ensure_task_model(self) -> Path:
         if self.config.model_asset_path:
@@ -156,9 +134,8 @@ class Stage1Extractor:
     def _distance(a: np.ndarray, b: np.ndarray) -> float:
         return float(np.linalg.norm(a - b))
 
-    def _compute_signal_from_landmarks(self, landmarks) -> Tuple[np.ndarray, float]:
+    def _compute_signal_from_landmarks(self, landmarks) -> tuple[np.ndarray, float]:
         wrist = self._landmark_xy(landmarks, 0)
-        middle_mcp = self._landmark_xy(landmarks, 9)
         index_mcp = self._landmark_xy(landmarks, 5)
         pinky_mcp = self._landmark_xy(landmarks, 17)
         thumb_tip = self._landmark_xy(landmarks, 4)
@@ -169,55 +146,13 @@ class Stage1Extractor:
         y = float(np.clip((wrist[1] - 0.5) * 2.0, -1.0, 1.0))
 
         palm_width = max(self._distance(index_mcp, pinky_mcp), 1e-6)
-        palm_length = max(self._distance(wrist, middle_mcp), 1e-6)
-        palm_scale = 0.5 * (palm_width + palm_length)
-
-        mode = (self.config.z_mode or "palm_scale").lower()
-        if mode == "palm_scale":
-            if self._depth_reference is None:
-                self._depth_reference = palm_scale
-            else:
-                self._depth_reference = 0.98 * self._depth_reference + 0.02 * palm_scale
-            z_raw = (self._depth_reference - palm_scale) / max(self._depth_reference, 1e-6)
-        elif mode == "mp_z_spread":
-            w = self._landmark_xyz(landmarks, 0)
-            tt = self._landmark_xyz(landmarks, 4)
-            it = self._landmark_xyz(landmarks, 8)
-            # Relative depth cues: fingertip z minus wrist z (hand model coords).
-            spread = float((tt[2] - w[2]) + (it[2] - w[2])) * 0.5
-            if self._z_signal_reference is None:
-                self._z_signal_reference = spread
-            else:
-                self._z_signal_reference = 0.98 * self._z_signal_reference + 0.02 * spread
-            denom = max(abs(self._z_signal_reference), 1e-3)
-            z_raw = (spread - self._z_signal_reference) / denom
-        elif mode == "mp_z_wrist":
-            wz = float(self._landmark_xyz(landmarks, 0)[2])
-            if self._z_signal_reference is None:
-                self._z_signal_reference = wz
-            else:
-                self._z_signal_reference = 0.98 * self._z_signal_reference + 0.02 * wz
-            denom = max(abs(self._z_signal_reference), 1e-3)
-            z_raw = (wz - self._z_signal_reference) / denom
-        elif mode == "reach_2d":
-            reach = float(self._distance(wrist, index_tip) / max(palm_scale, 1e-6))
-            if self._reach_reference is None:
-                self._reach_reference = reach
-            else:
-                self._reach_reference = 0.98 * self._reach_reference + 0.02 * reach
-            z_raw = (reach - self._reach_reference) / max(self._reach_reference, 1e-6)
-        else:
-            raise ValueError(f"Unknown z_mode: {self.config.z_mode!r}")
-
-        z = float(np.clip(z_raw, -self.config.max_depth_magnitude, self.config.max_depth_magnitude))
-
         pinch_dist = self._distance(thumb_tip, index_tip)
-        pinch_ratio = pinch_dist / palm_scale
+        pinch_ratio = pinch_dist / palm_width
         g = 1.0 if pinch_ratio < self.config.pinch_threshold else 0.0
 
-        return np.array([x, y, z, g], dtype=np.float32), pinch_ratio
+        return np.array([x, y, g], dtype=np.float32), pinch_ratio
 
-    def process_frame(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, Optional[HandControlSignal]]:
+    def process_frame(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, Optional[HandControlSignal]]:
         signal: Optional[HandControlSignal] = None
         if self._backend == "solutions":
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -225,18 +160,15 @@ class Stage1Extractor:
 
             if results.multi_hand_landmarks:
                 hand_landmarks = results.multi_hand_landmarks[0]
-                xyzg_raw, pinch_ratio = self._compute_signal_from_landmarks(hand_landmarks)
-                signal = self._smooth_and_pack(xyzg_raw, pinch_ratio)
+                xyg_raw, pinch_ratio = self._compute_signal_from_landmarks(hand_landmarks)
+                signal = self._smooth_and_pack(xyg_raw, pinch_ratio)
                 self._drawer.draw_landmarks(
                     frame_bgr,
                     hand_landmarks,
                     self._mp_hands.HAND_CONNECTIONS,
                 )
             else:
-                self._prev_xyzg = None
-                self._depth_reference = None
-                self._z_signal_reference = None
-                self._reach_reference = None
+                self._prev_xyg = None
         else:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -247,33 +179,29 @@ class Stage1Extractor:
 
             if results.hand_landmarks:
                 hand_landmarks = results.hand_landmarks[0]
-                xyzg_raw, pinch_ratio = self._compute_signal_from_landmarks(hand_landmarks)
-                signal = self._smooth_and_pack(xyzg_raw, pinch_ratio)
+                xyg_raw, pinch_ratio = self._compute_signal_from_landmarks(hand_landmarks)
+                signal = self._smooth_and_pack(xyg_raw, pinch_ratio)
                 self._draw_task_landmarks(frame_bgr, hand_landmarks)
             else:
-                self._prev_xyzg = None
-                self._depth_reference = None
-                self._z_signal_reference = None
-                self._reach_reference = None
+                self._prev_xyg = None
 
         return frame_bgr, signal
 
-    def _smooth_and_pack(self, xyzg_raw: np.ndarray, pinch_ratio: float) -> HandControlSignal:
-        if self._prev_xyzg is None:
-            xyzg_smoothed = xyzg_raw
+    def _smooth_and_pack(self, xyg_raw: np.ndarray, pinch_ratio: float) -> HandControlSignal:
+        if self._prev_xyg is None:
+            xyg_smoothed = xyg_raw
         else:
             alpha = self.config.smoothing_alpha
-            xyzg_smoothed = alpha * xyzg_raw + (1.0 - alpha) * self._prev_xyzg
+            xyg_smoothed = alpha * xyg_raw + (1.0 - alpha) * self._prev_xyg
 
         # Keep g discrete after smoothing.
-        xyzg_smoothed[3] = 1.0 if xyzg_raw[3] > 0.5 else 0.0
-        self._prev_xyzg = xyzg_smoothed
+        xyg_smoothed[2] = 1.0 if xyg_raw[2] > 0.5 else 0.0
+        self._prev_xyg = xyg_smoothed
 
         return HandControlSignal(
-            x=float(xyzg_smoothed[0]),
-            y=float(xyzg_smoothed[1]),
-            z=float(xyzg_smoothed[2]),
-            g=float(xyzg_smoothed[3]),
+            x=float(xyg_smoothed[0]),
+            y=float(xyg_smoothed[1]),
+            g=float(xyg_smoothed[2]),
             timestamp=time.time(),
             hand_present=True,
             pinch_ratio=float(pinch_ratio),

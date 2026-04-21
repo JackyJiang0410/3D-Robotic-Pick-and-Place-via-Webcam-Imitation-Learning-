@@ -11,7 +11,7 @@ from stage1_sensory_input import Stage1Config, Stage1Extractor
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Stage 1 webcam -> [x, y, z, g] extraction.")
+    parser = argparse.ArgumentParser(description="Run Stage 1 webcam -> [x, y, g] extraction.")
     parser.add_argument("--camera-id", type=int, default=0, help="OpenCV webcam index.")
     parser.add_argument("--width", type=int, default=1280, help="Capture width.")
     parser.add_argument("--height", type=int, default=720, help="Capture height.")
@@ -61,7 +61,7 @@ def main() -> None:
         out_file = out_path.open("a", encoding="utf-8")
 
     print("Stage 1 started. Press 'q' in preview window to quit.")
-    print("Output schema: {'x': float, 'y': float, 'z': float, 'g': float, 't': float}")
+    print("Output schema: {'x': float, 'y': float, 'g': float, 't': float}")
     if out_file is not None:
         print(f"Saving JSONL output to: {out_file.name}")
 
@@ -84,7 +84,6 @@ def main() -> None:
                 payload = {
                     "x": round(signal.x, 4),
                     "y": round(signal.y, 4),
-                    "z": round(signal.z, 4),
                     "g": round(signal.g, 1),
                     "t": round(signal.timestamp, 3),
                 }
@@ -97,7 +96,7 @@ def main() -> None:
 
             if not args.no_preview:
                 if signal is not None:
-                    status = f"x={signal.x:+.2f} y={signal.y:+.2f} z={signal.z:+.2f} g={signal.g:.0f}"
+                    status = f"x={signal.x:+.2f} y={signal.y:+.2f} g={signal.g:.0f}"
                 else:
                     status = "No hand detected"
 

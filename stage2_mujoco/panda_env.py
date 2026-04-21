@@ -40,8 +40,8 @@ class PandaPickPlaceEnv:
 
     - Model: `assets/mujoco/panda_pick_place_scene.xml` (includes Menagerie `panda.xml`)
     - Observation: low-dimensional state vector
-    - Action: [dx, dy, dz, g]
-        - dx/dy/dz: desired end-effector delta position (meters per step, pre-scaled)
+    - Action: [dx, dy, g]
+        - dx/dy: desired end-effector delta position (meters per step, pre-scaled)
         - g: 1.0 close, 0.0 open
 
     Control:
@@ -108,7 +108,7 @@ class PandaPickPlaceEnv:
 
     @property
     def action_dim(self) -> int:
-        return 4
+        return 3
 
     def reset(self, seed: Optional[int] = None) -> PandaObs:
         if seed is not None:
@@ -160,10 +160,11 @@ class PandaPickPlaceEnv:
 
     def step(self, action: np.ndarray) -> PandaObs:
         a = np.asarray(action, dtype=np.float32).reshape(-1)
-        if a.shape[0] != 4:
-            raise ValueError(f"Expected action shape (4,), got {a.shape}")
+        if a.shape[0] != 3:
+            raise ValueError(f"Expected action shape (3,), got {a.shape}")
 
-        dx, dy, dz, g = float(a[0]), float(a[1]), float(a[2]), float(a[3])
+        dx, dy, g = float(a[0]), float(a[1]), float(a[2])
+        dz = 0.0
         self._ee_target = np.clip(self._ee_target + np.array([dx, dy, dz], dtype=np.float32), self.workspace_min, self.workspace_max)
 
         # IK: move arm joints toward ee target.
