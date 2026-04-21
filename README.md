@@ -106,7 +106,7 @@ This lets you teleoperate only `x,y` and use pinch as the event trigger to test 
 
 You can make the macro slower/smoother with:
 
-- `--auto-time-scale` (default `20.0`; larger is slower)
+- `--auto-time-scale` (default `10.0`; larger is slower)
 - `--auto-ease smoothstep` (default) for ease-in/ease-out interpolation
 - `--auto-grasp-offset` (default `0.10`) to keep descend target higher above the object center
 - `--auto-table-top-z` and `--auto-table-clearance-z` to enforce a safe minimum hand-body z during descend (prevents table collision)

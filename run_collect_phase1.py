@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--auto-time-scale",
         type=float,
-        default=20.0,
+        default=10.0,
         help="Slow down auto pick-place sequence by this multiplier (>=1 is slower).",
     )
     p.add_argument(
@@ -167,18 +167,27 @@ class AutoPickPlaceSequence:
         alpha_eased = self._ease(alpha)
 
         pre_hover_xyz = np.array([self.pre_xyz[0], self.pre_xyz[1], self.pre_hover_z], dtype=np.float32)
+        pre_grasp_xyz = np.array([self.pre_xyz[0], self.pre_xyz[1], self.grasp_z], dtype=np.float32)
         pre_lift_xyz = np.array([self.pre_xyz[0], self.pre_xyz[1], self.lift_z], dtype=np.float32)
         home_lift_xyz = np.array([self.home_xy[0], self.home_xy[1], self.lift_z], dtype=np.float32)
         home_place_xyz = np.array([self.home_xy[0], self.home_xy[1], self.place_z], dtype=np.float32)
 
         if name == "descend":
-            env.set_ee_target_z(self._interp(self.pre_hover_z, self.grasp_z, alpha_eased))
+            descend_xyz = np.array(
+                [self.pre_xyz[0], self.pre_xyz[1], self._interp(self.pre_hover_z, self.grasp_z, alpha_eased)],
+                dtype=np.float32,
+            )
+            env.set_ee_target(descend_xyz)
             act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         elif name == "close":
-            env.set_ee_target_z(self.grasp_z)
+            env.set_ee_target(pre_grasp_xyz)
             act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         elif name == "lift":
-            env.set_ee_target_z(self._interp(self.grasp_z, self.lift_z, alpha_eased))
+            lift_xyz = np.array(
+                [self.pre_xyz[0], self.pre_xyz[1], self._interp(self.grasp_z, self.lift_z, alpha_eased)],
+                dtype=np.float32,
+            )
+            env.set_ee_target(lift_xyz)
             act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
             if float(obs.obj_pos[2]) > (self.grasp_z + 0.03):
                 self.success_lifted = True
