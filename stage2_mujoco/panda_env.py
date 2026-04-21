@@ -58,6 +58,7 @@ class PandaPickPlaceEnv:
         ik_iters: int = 8,
         workspace_min: tuple[float, float, float] = (0.25, -0.35, 0.15),
         workspace_max: tuple[float, float, float] = (0.85, 0.35, 0.75),
+        ee_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.10),
     ):
         self.model_path = Path(model_path) if model_path else DEFAULT_PANDA_SCENE
         self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
@@ -68,6 +69,7 @@ class PandaPickPlaceEnv:
         self.ik_iters = int(ik_iters)
         self.workspace_min = np.array(workspace_min, dtype=np.float32)
         self.workspace_max = np.array(workspace_max, dtype=np.float32)
+        self._ee_local_offset = np.array(ee_local_offset, dtype=np.float64)
 
         self._hand_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
         self._obj_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "object")
@@ -198,8 +200,10 @@ class PandaPickPlaceEnv:
         return self.observe()
 
     def _ee_pos(self) -> np.ndarray:
-        # Use the hand body position as a simple end-effector point.
-        return self.data.xpos[self._hand_body_id]
+        # Track a tool-center-point offset from the hand frame (near gripper center),
+        # not the hand origin, to reduce XY drift during vertical moves.
+        xmat = self.data.xmat[self._hand_body_id].reshape(3, 3)
+        return self.data.xpos[self._hand_body_id] + xmat @ self._ee_local_offset
 
     def _ik_track_target(self, target_pos: np.ndarray) -> None:
         jacp = np.zeros((3, self.model.nv), dtype=np.float64)
@@ -211,7 +215,7 @@ class PandaPickPlaceEnv:
             if float(np.linalg.norm(err)) < 1e-4:
                 break
 
-            mujoco.mj_jacBody(self.model, self.data, jacp, jacr, self._hand_body_id)
+            mujoco.mj_jac(self.model, self.data, jacp, jacr, cur, self._hand_body_id)
             J = jacp[:, self._arm_dof_adr]  # (3,7)
 
             # Damped least squares: dq = J^T (J J^T + λI)^-1 * err
