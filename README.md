@@ -49,7 +49,7 @@ python run_stage1.py --camera-id 0 --width 1280 --height 720
 Stream gestures to a JSONL file:
 
 ```bash
-python run_stage1.py --out data/stage1.jsonl --max-seconds 30
+python run_stage1.py --out data/datasets/stage1.jsonl --max-seconds 30
 ```
 
 `data/` is gitignored.
@@ -63,7 +63,7 @@ This is the command currently used to collect data, including per-step RGB image
 ```bash
 mjpython run_collect_phase1.py \
   --viewer --preview \
-  --dataset data/phase1_vision.zarr \
+  --dataset data/datasets/phase1_vision.zarr \
   --save-images --image-camera agent_view --image-size 128x128 \
   --seconds 600
 ```
@@ -74,7 +74,7 @@ State-only variant (no images, smaller dataset):
 
 ```bash
 mjpython run_collect_phase1.py --viewer --preview \
-  --dataset data/phase1_panda_demos.zarr --seconds 600
+  --dataset data/datasets/phase1_panda_demos.zarr --seconds 600
 ```
 
 ### How collection works
@@ -145,7 +145,7 @@ Example — collect with a wider spawn rectangle:
 ```bash
 mjpython run_collect_phase1.py \
   --viewer --preview \
-  --dataset data/phase1_vision.zarr \
+  --dataset data/datasets/phase1_vision.zarr \
   --save-images --image-camera agent_view --image-size 128x128 \
   --seconds 600 \
   --spawn-x-range 0.38,0.72 \
@@ -184,18 +184,18 @@ Recording stops at the first moment grasp is confirmed (typically partway throug
 
 ```bash
 python run_train_bc_phase1.py \
-  --dataset data/phase1_vision.zarr \
-  --out data/phase1_panda_bc_policy.npz
+  --dataset data/datasets/phase1_vision.zarr \
+  --out data/policies/phase1_panda_bc_policy.npz
 ```
 
 ### Train EgoVerse-style policy (obs + optional image)
 
-This trainer uses `data/phase1_vision.zarr` and learns a neural BC policy:
+This trainer uses `data/datasets/phase1_vision.zarr` and learns a neural BC policy:
 
 ```bash
 python run_train_egoverse_phase1.py \
-  --dataset data/phase1_vision.zarr \
-  --out data/egoverse_bc_policy.pt \
+  --dataset data/datasets/phase1_vision.zarr \
+  --out data/policies/egoverse_bc_policy.pt \
   --epochs 30 --batch-size 256
 ```
 
@@ -209,7 +209,7 @@ python run_train_egoverse_phase1.py \
 ```bash
 mjpython run_eval_bc_phase1.py \
   --viewer \
-  --policy data/phase1_panda_bc_policy.npz \
+  --policy data/policies/phase1_panda_bc_policy.npz \
   --seconds 30
 ```
 
@@ -218,7 +218,7 @@ Evaluate the EgoVerse-style checkpoint:
 ```bash
 python .venv/bin/mjpython run_eval_egoverse_phase1.py \
   --viewer \
-  --policy data/egoverse_bc_policy.pt \
+  --policy data/policies/egoverse_bc_policy.pt \
   --seconds 30 \
   --image-camera agent_view
 ```
@@ -253,7 +253,9 @@ robotics_2d_test/
 │   ├── mujoco/
 │   │   └── panda_pick_place_scene.xml
 │   └── robots/mujoco_menagerie/franka_emika_panda/   # vendored MJCF + meshes
-├── data/                         # gitignored — datasets and policies live here
+├── data/
+│   ├── datasets/                 # gitignored — zarr/jsonl data
+│   └── policies/                 # gitignored — trained checkpoints
 ├── requirements.txt
 └── README.md
 ```

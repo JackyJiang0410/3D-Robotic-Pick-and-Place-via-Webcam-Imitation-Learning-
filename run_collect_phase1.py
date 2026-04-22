@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
         default=0.005,
         help="Meters per step for full-scale x/y gesture (maps to dx/dy).",
     )
-    p.add_argument("--dataset", type=str, default="data/phase1_demos.zarr")
+    p.add_argument("--dataset", type=str, default="data/datasets/phase1_demos.zarr")
     p.add_argument("--episode-name", type=str, default=None, help="Optional name like ep_000123.")
     p.add_argument(
         "--seed",

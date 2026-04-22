@@ -68,8 +68,8 @@ class EgoVerseStyleBC(nn.Module):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train EgoVerse-style BC policy from Phase1 Zarr.")
-    p.add_argument("--dataset", type=str, default="data/phase1_vision.zarr")
-    p.add_argument("--out", type=str, default="data/egoverse_bc_policy.pt")
+    p.add_argument("--dataset", type=str, default="data/datasets/phase1_vision.zarr")
+    p.add_argument("--out", type=str, default="data/policies/egoverse_bc_policy.pt")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)

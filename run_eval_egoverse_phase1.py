@@ -16,7 +16,7 @@ from stage2_mujoco.panda_env import PandaPickPlaceEnv
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate EgoVerse-style BC policy in MuJoCo.")
     p.add_argument("--viewer", action="store_true")
-    p.add_argument("--policy", type=str, default="data/egoverse_bc_policy.pt")
+    p.add_argument("--policy", type=str, default="data/policies/egoverse_bc_policy.pt")
     p.add_argument("--seconds", type=float, default=30.0)
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--image-camera", type=str, default="agent_view")
@@ -32,6 +32,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Require this many consecutive near-target control steps before triggering scripted phase.",
+    )
+    p.add_argument(
+        "--act-scale-xy",
+        type=float,
+        default=0.5,
+        help="Scale factor applied to policy dx,dy during approach (lower is more conservative).",
+    )
+    p.add_argument(
+        "--act-max-xy",
+        type=float,
+        default=0.02,
+        help="Clamp magnitude of each XY action component to [-act-max-xy, +act-max-xy].",
+    )
+    p.add_argument(
+        "--act-deadband-xy",
+        type=float,
+        default=0.001,
+        help="Set |dx|,|dy| below this threshold to zero to reduce drift from tiny residuals.",
     )
     p.add_argument("--auto-time-scale", type=float, default=2.0, help="Slow down scripted post-pinch sequence.")
     p.add_argument(
@@ -238,6 +256,11 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
             # For this hybrid controller we only learn approach motion; gripper
             # closure/opening is scripted in the post-trigger routine.
             act[2] = 0.0
+            act[:2] *= float(args.act_scale_xy)
+            act[:2] = np.clip(act[:2], -float(args.act_max_xy), float(args.act_max_xy))
+            dead = float(args.act_deadband_xy)
+            act[0] = 0.0 if abs(float(act[0])) < dead else float(act[0])
+            act[1] = 0.0 if abs(float(act[1])) < dead else float(act[1])
 
             ee_xy = obs.ee_pos[:2].astype(np.float32)
             obj_xy = obs.obj_pos[:2].astype(np.float32)
@@ -291,7 +314,8 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
 
         now = time.time()
         if now - last_print > 0.5:
-            print(f"ctrl={act}")
+            dist_xy_now = float(np.linalg.norm(obs.ee_pos[:2] - obs.obj_pos[:2]))
+            print(f"ctrl={act} | dist_xy={dist_xy_now:.4f}m | near_count={near_count}")
             last_print = now
         time.sleep(env.model.opt.timestep)
 

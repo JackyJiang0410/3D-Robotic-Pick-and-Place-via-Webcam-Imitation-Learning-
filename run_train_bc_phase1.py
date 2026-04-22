@@ -23,8 +23,8 @@ class BCModel:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 1: behavior cloning (ridge regression) from Zarr demos.")
-    p.add_argument("--dataset", type=str, default="data/phase1_demos.zarr")
-    p.add_argument("--out", type=str, default="data/phase1_bc_policy.npz")
+    p.add_argument("--dataset", type=str, default="data/datasets/phase1_demos.zarr")
+    p.add_argument("--out", type=str, default="data/policies/phase1_bc_policy.npz")
     p.add_argument("--lambda", dest="lam", type=float, default=1e-3, help="Ridge regularization strength.")
     return p.parse_args()
 

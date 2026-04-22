@@ -29,7 +29,7 @@ class BCModel:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 1: evaluate BC policy autonomously in MuJoCo.")
     p.add_argument("--viewer", action="store_true", help="Open MuJoCo passive viewer.")
-    p.add_argument("--policy", type=str, default="data/phase1_bc_policy.npz")
+    p.add_argument("--policy", type=str, default="data/policies/phase1_bc_policy.npz")
     p.add_argument("--seconds", type=float, default=20.0)
     p.add_argument("--seed", type=int, default=1)
     return p.parse_args()
