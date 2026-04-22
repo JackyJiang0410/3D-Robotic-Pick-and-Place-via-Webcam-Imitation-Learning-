@@ -14,38 +14,13 @@ The user controls only the end-effector **X/Y** with their hand. A **pinch** tri
 ## Requirements
 
 - **Python**: 3.10+ (matches common `mediapipe` wheels)
-- **OS**: macOS supported. For MuJoCo passive viewer on macOS, launch via `mjpython ...` from the same environment where `mujoco` is installed.
+- **OS**: macOS supported. The MuJoCo passive viewer requires `mjpython` on macOS.
 - **Hardware**: any laptop webcam
 
-### Create environment (recommended)
-
-Choose one:
-
-#### Option A: `venv`
+### Install
 
 ```bash
-# If `python3` points to a broken system interpreter, use `python` instead.
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-#### Option B: `conda`
-
-```bash
-conda create -n panda2d python=3.11 -y
-conda activate panda2d
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-
-### Verify MuJoCo launcher
-
-```bash
-python -c "import mujoco; print('mujoco version:', mujoco.__version__)"
-# If your project path contains spaces (like "CS 395T"), run mjpython via python:
-python .venv/bin/mjpython -c "print('mjpython entry works')"
 ```
 
 Key deps: `mediapipe`, `opencv-python`, `numpy`, `mujoco`, `glfw`, `zarr`.
@@ -86,20 +61,19 @@ python run_stage1.py --out data/stage1.jsonl --max-seconds 30
 This is the command currently used to collect data, including per-step RGB images for vision-based IL:
 
 ```bash
-python .venv/bin/mjpython run_collect_phase1.py \
+mjpython run_collect_phase1.py \
   --viewer --preview \
   --dataset data/phase1_vision.zarr \
   --save-images --image-camera agent_view --image-size 128x128 \
   --seconds 600
 ```
 
-> On macOS, when `--viewer` is set, do **not** use plain `python`.  
-> If your path has spaces, use `python .venv/bin/mjpython ...` exactly as above.
+> On macOS you **must** launch with `mjpython` (not plain `python`) when `--viewer` is set, otherwise the MuJoCo passive viewer cannot attach to the main thread.
 
 State-only variant (no images, smaller dataset):
 
 ```bash
-python .venv/bin/mjpython run_collect_phase1.py --viewer --preview \
+mjpython run_collect_phase1.py --viewer --preview \
   --dataset data/phase1_panda_demos.zarr --seconds 600
 ```
 
@@ -108,7 +82,7 @@ python .venv/bin/mjpython run_collect_phase1.py --viewer --preview \
 - One **episode** = one pick attempt = "from `env.reset()` until the auto sequence completes."
 - Recording **starts immediately on reset** (so your **teleop approach** — moving the EE above the cube — is captured), and **stops the moment grasp is confirmed** (cube lifted ≥ `--success-lift`). The hardcoded place phase still plays so you can see the cube land, but those frames are intentionally **not** saved (nothing for the policy to learn there).
 - Episodes are **only persisted to Zarr if grasp succeeded**. Failed attempts are discarded by default. Use `--save-failures` to keep them.
-- After each attempt the env resets with the cube respawned at a slightly randomized XY (so the dataset covers a small distribution rather than one fixed pose).
+- After each attempt the env resets with the cube respawned at a uniformly sampled XY inside a configurable rectangle (see **Cube spawn range** below), so the dataset covers a distribution rather than one fixed pose. The cube XY is written into every `obs` row (`obj_pos` at `obs[34:37]`) **and** is visible in the `img` stream, so both state-based and vision-based policies can learn from the randomized spawns.
 
 ### What's in the dataset
 
@@ -153,6 +127,41 @@ Quit the OpenCV preview window with `q`.
 - `--preview` — show OpenCV webcam window (on macOS this can occasionally conflict with the MuJoCo viewer; omit if it crashes)
 - `--print-hz`, `--verbose-numbers` — terminal output controls
 
+**Cube spawn range**
+
+The cube is spawned uniformly at random within an axis-aligned rectangle in world XY at each `env.reset()`. The rectangle is set via CLI flags and is automatically clipped to the arm workspace.
+
+- `--spawn-x-range` — `"lo,hi"` in meters along world **X** (depth, away from the robot base). Default `0.40,0.70` (a ~30 cm strip).
+- `--spawn-y-range` — `"lo,hi"` in meters along world **Y** (left/right). Default `0.04,0.12` (a narrow ~8 cm strip).
+
+At startup the effective rectangle is printed (after workspace clipping), e.g.:
+
+```
+[ENV] Cube spawn rectangle: x in [0.400, 0.700] m, y in [0.040, 0.120] m (clipped to workspace).
+```
+
+Example — collect with a wider spawn rectangle:
+
+```bash
+mjpython run_collect_phase1.py \
+  --viewer --preview \
+  --dataset data/phase1_vision.zarr \
+  --save-images --image-camera agent_view --image-size 128x128 \
+  --seconds 600 \
+  --spawn-x-range 0.38,0.72 \
+  --spawn-y-range 0.05,0.11
+```
+
+To spawn at a single fixed pose (e.g. for debugging the policy on a known position), collapse each range to a point:
+
+```bash
+mjpython run_collect_phase1.py --viewer ... \
+  --spawn-x-range 0.55,0.55 \
+  --spawn-y-range 0.08,0.08
+```
+
+> For behavior cloning to generalize in XY you want a **range**, not a fixed spawn — the cube position is what the policy conditions its actions on. Fixing it usually causes the policy to memorize one trajectory.
+
 **Auto pick-place tuning**
 
 - `--auto-time-scale` — multiplier on phase durations (default `10.0`; **larger = slower**). Bump down to ~5 for faster runs, up to ~15 for very deliberate motion.
@@ -184,7 +193,7 @@ python run_train_bc_phase1.py \
 ## Evaluate the policy in MuJoCo
 
 ```bash
-python .venv/bin/mjpython run_eval_bc_phase1.py \
+mjpython run_eval_bc_phase1.py \
   --viewer \
   --policy data/phase1_panda_bc_policy.npz \
   --seconds 30
@@ -197,7 +206,7 @@ python .venv/bin/mjpython run_eval_bc_phase1.py \
 Useful for visually checking the model loads and the camera framings look right:
 
 ```bash
-python .venv/bin/mjpython run_view_panda.py
+mjpython run_view_panda.py
 ```
 
 ---
@@ -229,9 +238,7 @@ robotics_2d_test/
 
 ## Troubleshooting
 
-- **`mjpython: command not found`** — your shell is not using the project env. Run `source .venv/bin/activate` first.
-- **`bad interpreter .../Desktop/CS: no such file or directory`** — your path has spaces; invoke `mjpython` through python: `python .venv/bin/mjpython ...`.
-- **`mujoco` viewer error / hang on macOS** — ensure you launch with `mjpython ...` whenever `--viewer` is set.
+- **`mujoco` viewer error / hang on macOS** — you must launch with `mjpython`, not `python`, whenever `--viewer` is set.
 - **Camera not opening** — grant the terminal app camera permission in System Settings → Privacy & Security → Camera.
 - **OpenCV preview crashes alongside the MuJoCo viewer** — drop `--preview`. The data collection still works headlessly; you'll just lose the on-screen webcam HUD.
 - **Robot looks like it's clipping the cube briefly** — minor visual artifact only; the physical contact is correct (the IK runs in a scratch pass and the arm is driven through the position-controlled actuators, so collisions are respected by the physics engine).

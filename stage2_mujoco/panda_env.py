@@ -59,6 +59,8 @@ class PandaPickPlaceEnv:
         workspace_min: tuple[float, float, float] = (0.25, -0.35, 0.15),
         workspace_max: tuple[float, float, float] = (0.85, 0.35, 0.75),
         fingertip_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.045),
+        spawn_x_range: tuple[float, float] = (0.40, 0.70),
+        spawn_y_range: tuple[float, float] = (0.04, 0.12),
     ):
         self.model_path = Path(model_path) if model_path else DEFAULT_PANDA_SCENE
         self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
@@ -70,6 +72,7 @@ class PandaPickPlaceEnv:
         self.workspace_min = np.array(workspace_min, dtype=np.float32)
         self.workspace_max = np.array(workspace_max, dtype=np.float32)
         self._fingertip_local_offset = np.array(fingertip_local_offset, dtype=np.float64)
+        self.set_spawn_range(spawn_x_range, spawn_y_range)
 
         self._hand_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
         self._left_finger_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "left_finger")
@@ -139,6 +142,33 @@ class PandaPickPlaceEnv:
         return self.workspace_min.copy(), self.workspace_max.copy()
 
     @property
+    def spawn_range(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """Current (x_range, y_range) used to uniformly sample the cube at reset."""
+        return (
+            (float(self._spawn_x_lo), float(self._spawn_x_hi)),
+            (float(self._spawn_y_lo), float(self._spawn_y_hi)),
+        )
+
+    def set_spawn_range(
+        self,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+    ) -> None:
+        """Set the axis-aligned rectangle (in world XY) within which the cube is spawned at reset.
+
+        ``x_range`` and ``y_range`` are (lo, hi) pairs in meters in world frame. They are automatically
+        clipped to the arm workspace so the cube always lands somewhere the robot can actually reach.
+        """
+        x_lo, x_hi = sorted((float(x_range[0]), float(x_range[1])))
+        y_lo, y_hi = sorted((float(y_range[0]), float(y_range[1])))
+        x_lo = float(np.clip(x_lo, self.workspace_min[0], self.workspace_max[0]))
+        x_hi = float(np.clip(x_hi, self.workspace_min[0], self.workspace_max[0]))
+        y_lo = float(np.clip(y_lo, self.workspace_min[1], self.workspace_max[1]))
+        y_hi = float(np.clip(y_hi, self.workspace_min[1], self.workspace_max[1]))
+        self._spawn_x_lo, self._spawn_x_hi = x_lo, x_hi
+        self._spawn_y_lo, self._spawn_y_hi = y_lo, y_hi
+
+    @property
     def ee_target(self) -> np.ndarray:
         return self._ee_target.copy()
 
@@ -165,13 +195,14 @@ class PandaPickPlaceEnv:
         # Cache the home arm pose for null-space pulls in IK (prevents wrist drift during long descend/lift).
         self._arm_rest_qpos = self.data.qpos[self._arm_qpos_adr].astype(np.float64).copy()
 
-        # Randomize object pose on the table top (sim-only). Z is set to (table_top + half_height)
+        # Randomize object pose on the table top (sim-only). XY is sampled uniformly from the
+        # configured spawn rectangle (see set_spawn_range); Z is set to (table_top + half_height)
         # so the cube starts exactly resting on the table and does not fall/bounce at t=0.
         obj_jnt = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "object")
         if obj_jnt >= 0:
             adr = int(self.model.jnt_qposadr[obj_jnt])
-            self.data.qpos[adr + 0] = 0.55 + 0.10 * (np.random.rand() - 0.5)
-            self.data.qpos[adr + 1] = 0.08 + 0.10 * (np.random.rand() - 0.5)
+            self.data.qpos[adr + 0] = float(np.random.uniform(self._spawn_x_lo, self._spawn_x_hi))
+            self.data.qpos[adr + 1] = float(np.random.uniform(self._spawn_y_lo, self._spawn_y_hi))
             self.data.qpos[adr + 2] = self._object_rest_z
             self.data.qpos[adr + 3 : adr + 7] = np.array([1, 0, 0, 0], dtype=np.float64)
 

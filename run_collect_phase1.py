@@ -27,7 +27,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--dataset", type=str, default="data/phase1_demos.zarr")
     p.add_argument("--episode-name", type=str, default=None, help="Optional name like ep_000123.")
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for deterministic resets. Omit for random cube spawn each run.",
+    )
     p.add_argument(
         "--print-hz",
         type=float,
@@ -70,10 +75,10 @@ def parse_args() -> argparse.Namespace:
         "--snap-to-cube",
         dest="snap_to_cube",
         action="store_true",
-        default=True,
+        default=False,
         help=(
             "On pinch trigger, snap the descend XY target to the cube's current XY position "
-            "so the grasp is centered (default ON for early data collection)."
+            "so the grasp is centered (default OFF for full manual teleop)."
         ),
     )
     p.add_argument(
@@ -131,7 +136,33 @@ def parse_args() -> argparse.Namespace:
         default="128x128",
         help="WxH for recorded images (e.g. 128x128, 256x256). Smaller = much smaller dataset.",
     )
+    p.add_argument(
+        "--spawn-x-range",
+        type=str,
+        default="0.40,0.70",
+        help=(
+            "Uniform spawn range for the cube along world X (depth from robot base), "
+            "as 'lo,hi' in meters. Default covers the long axis of the red spawn strip."
+        ),
+    )
+    p.add_argument(
+        "--spawn-y-range",
+        type=str,
+        default="0.04,0.12",
+        help=(
+            "Uniform spawn range for the cube along world Y (left/right), "
+            "as 'lo,hi' in meters. Default is a narrow strip matching the red rectangle."
+        ),
+    )
     return p.parse_args()
+
+
+def _parse_range(s: str, name: str) -> tuple[float, float]:
+    """Parse a 'lo,hi' string into a (lo, hi) float tuple."""
+    parts = s.replace(" ", "").split(",")
+    if len(parts) != 2:
+        raise ValueError(f"Bad --{name} {s!r}; expected 'lo,hi' like '0.40,0.70'.")
+    return float(parts[0]), float(parts[1])
 
 
 def _parse_image_size(s: str) -> tuple[int, int]:
@@ -362,7 +393,6 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
     obs0 = env.reset(seed=args.seed)
     obs = obs0
     home_xy = obs0.ee_pos[:2].astype(np.float32).copy()
-    home_seed = int(args.seed)
 
     # Optional offscreen renderer for vision-based IL data collection.
     renderer = None
@@ -560,8 +590,9 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                 auto_seq = None
 
                 if args.reset_between_attempts:
-                    home_seed += 1
-                    obs = env.reset(seed=home_seed)
+                    # Use stochastic reset so each new attempt gets a fresh randomized cube position.
+                    # PandaPickPlaceEnv.reset() randomizes object XY on the tabletop when seed is None.
+                    obs = env.reset(seed=None)
                     home_xy = obs.ee_pos[:2].astype(np.float32).copy()
                     print(
                         f"[ENV] Reset for next attempt. obj_xy=({obs.obj_pos[0]:.3f},{obs.obj_pos[1]:.3f})  "
@@ -661,7 +692,14 @@ def logger_episode_name(base_name: Optional[str], attempt_idx: int) -> Optional[
 
 def main() -> None:
     args = parse_args()
-    env = PandaPickPlaceEnv()
+    spawn_x = _parse_range(args.spawn_x_range, "spawn-x-range")
+    spawn_y = _parse_range(args.spawn_y_range, "spawn-y-range")
+    env = PandaPickPlaceEnv(spawn_x_range=spawn_x, spawn_y_range=spawn_y)
+    (sx_lo, sx_hi), (sy_lo, sy_hi) = env.spawn_range
+    print(
+        f"[ENV] Cube spawn rectangle: x in [{sx_lo:.3f}, {sx_hi:.3f}] m, "
+        f"y in [{sy_lo:.3f}, {sy_hi:.3f}] m (clipped to workspace)."
+    )
 
     if not args.viewer:
         run_loop(env, None, args)
