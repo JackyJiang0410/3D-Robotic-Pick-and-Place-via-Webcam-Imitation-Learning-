@@ -188,6 +188,20 @@ python run_train_bc_phase1.py \
   --out data/phase1_panda_bc_policy.npz
 ```
 
+### Train EgoVerse-style policy (obs + optional image)
+
+This trainer uses `data/phase1_vision.zarr` and learns a neural BC policy:
+
+```bash
+python run_train_egoverse_phase1.py \
+  --dataset data/phase1_vision.zarr \
+  --out data/egoverse_bc_policy.pt \
+  --epochs 30 --batch-size 256
+```
+
+- Default behavior uses both `obs` and `img` when `img` exists.
+- Add `--obs-only` if you only want low-dimensional state training.
+
 ---
 
 ## Evaluate the policy in MuJoCo
@@ -197,6 +211,16 @@ mjpython run_eval_bc_phase1.py \
   --viewer \
   --policy data/phase1_panda_bc_policy.npz \
   --seconds 30
+```
+
+Evaluate the EgoVerse-style checkpoint:
+
+```bash
+python .venv/bin/mjpython run_eval_egoverse_phase1.py \
+  --viewer \
+  --policy data/egoverse_bc_policy.pt \
+  --seconds 30 \
+  --image-camera agent_view
 ```
 
 ---
