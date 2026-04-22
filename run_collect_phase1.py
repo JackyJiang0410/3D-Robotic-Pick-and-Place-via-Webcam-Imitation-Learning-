@@ -390,9 +390,8 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
     # Per-episode buffer + counters.
     # NOTE: The buffer is created at episode start (right after env.reset) so the TELEOP APPROACH
     # (the part the model needs to learn -- "how to move ee_xy to above cube_xy") is recorded too.
-    # Recording STOPS the moment grasp success is detected; the auto sequence keeps playing the
-    # hardcoded place phase but those frames are not appended (they would just bloat the dataset
-    # with a fixed scripted motion the model would learn nothing from).
+    # Recording STOPS at pinch trigger (start of auto sequence); the scripted auto phase is not
+    # appended. We still evaluate grasp success during the auto phase to decide save/discard.
     buffer: EpisodeBuffer = EpisodeBuffer(
         image_camera=args.image_camera if renderer is not None else None,
     )
@@ -403,8 +402,8 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
 
     print(f"Writing dataset to: {Path(args.dataset).expanduser().resolve()}")
     print("Each EPISODE starts at env.reset() and ends when the auto pick-place sequence completes.")
-    print("Recording window = from reset (teleop approach) UNTIL grasp is detected.")
-    print("After grasp, the auto place phase still plays so you can see it, but is NOT recorded.")
+    print("Recording window = from reset (teleop approach) UNTIL pinch trigger.")
+    print("After pinch, the auto phase still plays so you can see it, but is NOT recorded.")
     print(
         f"Episodes are SAVED to Zarr only when the cube is lifted >= {args.success_lift:.3f} m "
         f"AND held by both fingers (use --save-failures to keep failed attempts too)."
@@ -485,6 +484,12 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                     ease_mode=str(args.auto_ease),
                 )
                 attempts += 1
+                if not buffer_grasp_locked:
+                    buffer_grasp_locked = True
+                    print(
+                        f"[REC ] Pinch trigger at step {len(buffer)}. Recording stopped; "
+                        f"auto sequence will run for validation only."
+                    )
                 print(
                     f"[AUTO #{attempts}] Triggered after {len(buffer)} teleop steps. "
                     f"pre=({pre_xyz[0]:.3f},{pre_xyz[1]:.3f},{hover_z:.3f}) "
@@ -505,9 +510,9 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
             now = time.time()
 
             # Append to the episode buffer. We append every tick from episode start (teleop included)
-            # UNTIL the grasp is detected (buffer_grasp_locked=True), at which point we stop. The
-            # auto sequence keeps running for the place phase but those frames are NOT recorded
-            # because the place is hardcoded -- nothing for the policy to learn there.
+            # UNTIL pinch trigger (buffer_grasp_locked=True), at which point we stop. The auto
+            # sequence keeps running for validation, but those frames are NOT recorded because it's
+            # scripted motion.
             if not buffer_grasp_locked:
                 step_img = None
                 if renderer is not None:
@@ -521,17 +526,18 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                             args._img_warn_emitted = True  # type: ignore[attr-defined]
                         renderer = None
                 buffer.append(obs.as_vector(), act, now, img=step_img)
-                lift = env.object_lift_height()
-                if lift > buffer.peak_lift_m:
-                    buffer.peak_lift_m = lift
-                if env.is_object_grasped(min_lift_m=args.success_lift):
-                    buffer.success = True
-                    buffer_grasp_locked = True
-                    print(
-                        f"[REC ] Grasp confirmed at step {len(buffer)} "
-                        f"(lift={buffer.peak_lift_m:.3f}m). Recording stopped; "
-                        f"the rest of the auto sequence will play but is not saved."
-                    )
+
+            # Keep success evaluation active even after recording has stopped, so we can still
+            # save only successful attempts while excluding scripted auto frames from the dataset.
+            lift = env.object_lift_height()
+            if lift > buffer.peak_lift_m:
+                buffer.peak_lift_m = lift
+            if (not buffer.success) and env.is_object_grasped(min_lift_m=args.success_lift):
+                buffer.success = True
+                print(
+                    f"[AUTO #{attempts}] Grasp confirmed during auto phase "
+                    f"(peak_lift={buffer.peak_lift_m:.3f}m)."
+                )
 
             if auto_seq is not None and done:
                 # Sequence finished. Persist the buffer if grasp succeeded; discard otherwise.

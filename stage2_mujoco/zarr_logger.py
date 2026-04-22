@@ -33,8 +33,9 @@ class ZarrTrajectoryLogger:
     def __init__(self, root_dir: str | Path):
         self.root_dir = Path(root_dir).expanduser().resolve()
         self.root_dir.mkdir(parents=True, exist_ok=True)
-        self.store = zarr.DirectoryStore(str(self.root_dir))
-        self.root = zarr.group(store=self.store, overwrite=False)
+        # Zarr v2 exposed DirectoryStore; Zarr v3 removed it.
+        # open_group(path, mode="a") works across both versions.
+        self.root = zarr.open_group(str(self.root_dir), mode="a")
         self.episodes = self.root.require_group("episodes")
         self.meta = self.root.require_group("meta")
         self.meta.attrs.setdefault("created_at", time.time())

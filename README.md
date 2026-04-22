@@ -14,13 +14,38 @@ The user controls only the end-effector **X/Y** with their hand. A **pinch** tri
 ## Requirements
 
 - **Python**: 3.10+ (matches common `mediapipe` wheels)
-- **OS**: macOS supported. The MuJoCo passive viewer requires `mjpython` on macOS.
+- **OS**: macOS supported. For MuJoCo passive viewer on macOS, launch via `mjpython ...` from the same environment where `mujoco` is installed.
 - **Hardware**: any laptop webcam
 
-### Install
+### Create environment (recommended)
+
+Choose one:
+
+#### Option A: `venv`
 
 ```bash
+# If `python3` points to a broken system interpreter, use `python` instead.
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+```
+
+#### Option B: `conda`
+
+```bash
+conda create -n panda2d python=3.11 -y
+conda activate panda2d
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+### Verify MuJoCo launcher
+
+```bash
+python -c "import mujoco; print('mujoco version:', mujoco.__version__)"
+# If your project path contains spaces (like "CS 395T"), run mjpython via python:
+python .venv/bin/mjpython -c "print('mjpython entry works')"
 ```
 
 Key deps: `mediapipe`, `opencv-python`, `numpy`, `mujoco`, `glfw`, `zarr`.
@@ -61,19 +86,20 @@ python run_stage1.py --out data/stage1.jsonl --max-seconds 30
 This is the command currently used to collect data, including per-step RGB images for vision-based IL:
 
 ```bash
-mjpython run_collect_phase1.py \
+python .venv/bin/mjpython run_collect_phase1.py \
   --viewer --preview \
   --dataset data/phase1_vision.zarr \
   --save-images --image-camera agent_view --image-size 128x128 \
   --seconds 600
 ```
 
-> On macOS you **must** launch with `mjpython` (not plain `python`) when `--viewer` is set, otherwise the MuJoCo passive viewer cannot attach to the main thread.
+> On macOS, when `--viewer` is set, do **not** use plain `python`.  
+> If your path has spaces, use `python .venv/bin/mjpython ...` exactly as above.
 
 State-only variant (no images, smaller dataset):
 
 ```bash
-mjpython run_collect_phase1.py --viewer --preview \
+python .venv/bin/mjpython run_collect_phase1.py --viewer --preview \
   --dataset data/phase1_panda_demos.zarr --seconds 600
 ```
 
@@ -158,7 +184,7 @@ python run_train_bc_phase1.py \
 ## Evaluate the policy in MuJoCo
 
 ```bash
-mjpython run_eval_bc_phase1.py \
+python .venv/bin/mjpython run_eval_bc_phase1.py \
   --viewer \
   --policy data/phase1_panda_bc_policy.npz \
   --seconds 30
@@ -171,7 +197,7 @@ mjpython run_eval_bc_phase1.py \
 Useful for visually checking the model loads and the camera framings look right:
 
 ```bash
-mjpython run_view_panda.py
+python .venv/bin/mjpython run_view_panda.py
 ```
 
 ---
@@ -203,7 +229,9 @@ robotics_2d_test/
 
 ## Troubleshooting
 
-- **`mujoco` viewer error / hang on macOS** — you must launch with `mjpython`, not `python`, whenever `--viewer` is set.
+- **`mjpython: command not found`** — your shell is not using the project env. Run `source .venv/bin/activate` first.
+- **`bad interpreter .../Desktop/CS: no such file or directory`** — your path has spaces; invoke `mjpython` through python: `python .venv/bin/mjpython ...`.
+- **`mujoco` viewer error / hang on macOS** — ensure you launch with `mjpython ...` whenever `--viewer` is set.
 - **Camera not opening** — grant the terminal app camera permission in System Settings → Privacy & Security → Camera.
 - **OpenCV preview crashes alongside the MuJoCo viewer** — drop `--preview`. The data collection still works headlessly; you'll just lose the on-screen webcam HUD.
 - **Robot looks like it's clipping the cube briefly** — minor visual artifact only; the physical contact is correct (the IK runs in a scratch pass and the arm is driven through the position-controlled actuators, so collisions are respected by the physics engine).
