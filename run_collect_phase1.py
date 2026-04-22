@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--auto-time-scale",
         type=float,
-        default=5.0,
+        default=10.0,
         help="Slow down auto pick-place sequence by this multiplier (>=1 is slower).",
     )
     p.add_argument(
@@ -60,8 +60,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--auto-grasp-offset",
         type=float,
-        default=0.01,
-        help="Target z above object center during auto descend (meters). Larger means less downward motion.",
+        default=0.0,
+        help=(
+            "Target z relative to object CENTER during auto descend (meters). "
+            "0.0 means TCP aims at the cube center (best grip). Positive lifts the grip toward the cube top."
+        ),
+    )
+    p.add_argument(
+        "--snap-to-cube",
+        dest="snap_to_cube",
+        action="store_true",
+        default=True,
+        help=(
+            "On pinch trigger, snap the descend XY target to the cube's current XY position "
+            "so the grasp is centered (default ON for early data collection)."
+        ),
+    )
+    p.add_argument(
+        "--no-snap-to-cube",
+        dest="snap_to_cube",
+        action="store_false",
+        help="Disable the XY-snap so demonstrations follow your hand position exactly (noisier).",
     )
     p.add_argument(
         "--auto-table-top-z",
@@ -75,7 +94,113 @@ def parse_args() -> argparse.Namespace:
         default=0.015,
         help="Minimum hand-body z above table top during descend to avoid collision.",
     )
+    p.add_argument(
+        "--success-lift",
+        type=float,
+        default=0.05,
+        help="Minimum lift height (meters) above the cube's rest z to count an attempt as successful.",
+    )
+    p.add_argument(
+        "--save-failures",
+        action="store_true",
+        help="Also save episodes where the pick failed (default: discard).",
+    )
+    p.add_argument(
+        "--reset-between-attempts",
+        action="store_true",
+        default=True,
+        help="Reset env (cube respawns, arm goes home) after each auto pick-place sequence.",
+    )
+    p.add_argument(
+        "--save-images",
+        action="store_true",
+        help=(
+            "Also record an RGB image per step into each saved episode's `img` dataset. "
+            "Off by default (lower disk + faster). Recommended for vision-based IL pipelines."
+        ),
+    )
+    p.add_argument(
+        "--image-camera",
+        type=str,
+        default="agent_view",
+        help="Name of the MuJoCo camera to render from (defined in the scene XML).",
+    )
+    p.add_argument(
+        "--image-size",
+        type=str,
+        default="128x128",
+        help="WxH for recorded images (e.g. 128x128, 256x256). Smaller = much smaller dataset.",
+    )
     return p.parse_args()
+
+
+def _parse_image_size(s: str) -> tuple[int, int]:
+    """Parse a 'WxH' string into (width, height)."""
+    parts = s.lower().split("x")
+    if len(parts) != 2:
+        raise ValueError(f"Bad --image-size {s!r}; expected like '128x128'.")
+    return int(parts[0]), int(parts[1])
+
+
+@dataclass
+class EpisodeBuffer:
+    """In-memory rolling buffer for a single pick attempt.
+
+    Steps are appended every control tick during one auto-sequence and are
+    only persisted to Zarr if the attempt is judged successful.
+    """
+
+    obs: List[np.ndarray] = field(default_factory=list)
+    act: List[np.ndarray] = field(default_factory=list)
+    t: List[float] = field(default_factory=list)
+    images: List[np.ndarray] = field(default_factory=list)
+    image_camera: Optional[str] = None
+    success: bool = False
+    peak_lift_m: float = 0.0
+
+    def append(
+        self,
+        obs_vec: np.ndarray,
+        act_vec: np.ndarray,
+        t: float,
+        img: Optional[np.ndarray] = None,
+    ) -> None:
+        self.obs.append(np.asarray(obs_vec, dtype=np.float32).copy())
+        self.act.append(np.asarray(act_vec, dtype=np.float32).copy())
+        self.t.append(float(t))
+        if img is not None:
+            self.images.append(np.asarray(img, dtype=np.uint8).copy())
+
+    def __len__(self) -> int:
+        return len(self.obs)
+
+    def commit(self, logger: ZarrTrajectoryLogger, name: Optional[str] = None) -> str:
+        if not self.obs:
+            raise RuntimeError("Cannot commit an empty episode.")
+        # If we recorded images they MUST line up with the obs/act stream so downstream code can
+        # index them step-by-step. Truncate to the shortest just in case render lagged a step.
+        has_images = len(self.images) > 0
+        if has_images and len(self.images) != len(self.obs):
+            n = min(len(self.images), len(self.obs))
+            self.obs = self.obs[:n]
+            self.act = self.act[:n]
+            self.t = self.t[:n]
+            self.images = self.images[:n]
+        image_shape = tuple(int(x) for x in self.images[0].shape) if has_images else None
+
+        ep = logger.start_episode(
+            obs_dim=self.obs[0].shape[0],
+            act_dim=self.act[0].shape[0],
+            name=name,
+            image_shape=image_shape,
+            image_camera=self.image_camera,
+        )
+        ep.group.attrs["success"] = bool(self.success)
+        ep.group.attrs["peak_lift_m"] = float(self.peak_lift_m)
+        for i in range(len(self.obs)):
+            img = self.images[i] if has_images else None
+            logger.append(ep, self.obs[i], self.act[i], self.t[i], img=img)
+        return ep.group.name
 
 
 def gesture_to_dxdyg(action_human: np.ndarray, delta_scale: float) -> np.ndarray:
@@ -132,6 +257,7 @@ class AutoPickPlaceSequence:
     PHASES = [
         ("descend", 0.7),
         ("close", 0.35),
+        ("hold", 0.4),
         ("lift", 0.8),
         ("return_pre", 0.9),
         ("move_home", 1.0),
@@ -182,6 +308,11 @@ class AutoPickPlaceSequence:
         elif name == "close":
             env.set_ee_target(pre_grasp_xyz)
             act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        elif name == "hold":
+            # Sit still with the gripper clamped so the contact forces fully settle and the cube
+            # stops wobbling before we start moving the arm.
+            env.set_ee_target(pre_grasp_xyz)
+            act = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         elif name == "lift":
             lift_xyz = np.array(
                 [self.pre_xyz[0], self.pre_xyz[1], self._interp(self.grasp_z, self.lift_z, alpha_eased)],
@@ -230,7 +361,24 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
     logger = ZarrTrajectoryLogger(args.dataset)
     obs0 = env.reset(seed=args.seed)
     obs = obs0
-    ep = logger.start_episode(obs_dim=obs0.as_vector().shape[0], act_dim=env.action_dim, name=args.episode_name)
+    home_xy = obs0.ee_pos[:2].astype(np.float32).copy()
+    home_seed = int(args.seed)
+
+    # Optional offscreen renderer for vision-based IL data collection.
+    renderer = None
+    if args.save_images:
+        try:
+            import mujoco as _mj  # local import to avoid breaking non-image runs
+            img_w, img_h = _parse_image_size(args.image_size)
+            renderer = _mj.Renderer(env.model, height=img_h, width=img_w)
+            print(
+                f"[IMG] Recording {img_w}x{img_h} RGB frames from camera '{args.image_camera}' "
+                f"into each saved episode (img dataset, uint8)."
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[IMG] WARNING: could not init Renderer ({exc!r}); continuing without images.")
+            renderer = None
+
     start = time.time()
     end = start + args.seconds
     last_print = 0.0
@@ -239,15 +387,35 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
     last_g_state = 0.0
     auto_seq: Optional[AutoPickPlaceSequence] = None
 
+    # Per-episode buffer + counters.
+    # NOTE: The buffer is created at episode start (right after env.reset) so the TELEOP APPROACH
+    # (the part the model needs to learn -- "how to move ee_xy to above cube_xy") is recorded too.
+    # Recording STOPS the moment grasp success is detected; the auto sequence keeps playing the
+    # hardcoded place phase but those frames are not appended (they would just bloat the dataset
+    # with a fixed scripted motion the model would learn nothing from).
+    buffer: EpisodeBuffer = EpisodeBuffer(
+        image_camera=args.image_camera if renderer is not None else None,
+    )
+    buffer_grasp_locked = False  # set True when grasp is detected -> stop appending further steps
+    attempts = 0
+    saved = 0
+    discarded = 0
+
     print(f"Writing dataset to: {Path(args.dataset).expanduser().resolve()}")
-    print(f"Episode: {ep.group.name}  (press Ctrl+C to stop early)")
+    print("Each EPISODE starts at env.reset() and ends when the auto pick-place sequence completes.")
+    print("Recording window = from reset (teleop approach) UNTIL grasp is detected.")
+    print("After grasp, the auto place phase still plays so you can see it, but is NOT recorded.")
+    print(
+        f"Episodes are SAVED to Zarr only when the cube is lifted >= {args.success_lift:.3f} m "
+        f"AND held by both fingers (use --save-failures to keep failed attempts too)."
+    )
     print("Gesture -> Panda action mapping:")
     print("  Move hand RIGHT  : +x -> -dx (ee moves -X)")
     print("  Move hand LEFT   : -x -> +dx (ee moves +X)")
     print("  Move hand UP     : -y -> +dy  (dy uses inverted y)")
     print("  Move hand DOWN   : +y -> -dy")
-    print("  Pinch fingers    : g=1 -> CLOSE gripper")
-    print("  Open fingers     : g=0 -> OPEN gripper")
+    print("  Pinch fingers    : g=1 -> trigger AUTO pick-place sequence")
+    print("  Open fingers     : g=0 -> OPEN gripper / no trigger")
     print("Tips: keep one hand centered in camera, move slowly, adjust --delta-scale.")
     print(
         "Auto sequence: descend -> close -> lift -> return_pre -> move_home -> "
@@ -281,8 +449,18 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                 ws_min, ws_max = env.workspace_bounds
                 ee_t = env.ee_target
                 pre_xyz = ee_t.copy()
-                home_xy = obs0.ee_pos[:2].astype(np.float32).copy()
                 hover_z = float(ee_t[2])
+                # Snap the descend XY target to the cube's current XY (clamped to workspace) so the
+                # grasp is well-centered. The user only needs to hover roughly above the cube and pinch.
+                if args.snap_to_cube:
+                    snap_xy = np.clip(
+                        obs.obj_pos[:2].astype(np.float32),
+                        ws_min[:2],
+                        ws_max[:2],
+                    )
+                    pre_xyz[0] = float(snap_xy[0])
+                    pre_xyz[1] = float(snap_xy[1])
+                    env.set_ee_target(pre_xyz)
                 # Keep safe margins from table and workspace bounds.
                 table_safe_z = float(args.auto_table_top_z + args.auto_table_clearance_z)
                 grasp_z = float(
@@ -306,26 +484,90 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                     time_scale=float(args.auto_time_scale),
                     ease_mode=str(args.auto_ease),
                 )
+                attempts += 1
                 print(
-                    f"[AUTO] Triggered: pre=({pre_xyz[0]:.3f},{pre_xyz[1]:.3f},{hover_z:.3f}) "
+                    f"[AUTO #{attempts}] Triggered after {len(buffer)} teleop steps. "
+                    f"pre=({pre_xyz[0]:.3f},{pre_xyz[1]:.3f},{hover_z:.3f}) "
                     f"home_xy=({home_xy[0]:.3f},{home_xy[1]:.3f}) "
-                    f"grasp_z={grasp_z:.3f} lift_z={lift_z:.3f}"
+                    f"grasp_z={grasp_z:.3f} lift_z={lift_z:.3f} | obj_xy=({obs.obj_pos[0]:.3f},{obs.obj_pos[1]:.3f})"
                 )
 
             if auto_seq is not None:
                 act, done = auto_seq.step(env, now, obs)
-                if done:
-                    seq_success = auto_seq.success_lifted
-                    print(f"[AUTO] Completed sequence. success_lifted={seq_success}")
-                    auto_seq = None
             elif signal is not None:
                 act = gesture_to_dxdyg(signal.as_vector(), args.delta_scale)
+                done = False
             else:
                 act = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                done = False
 
             obs = env.step(act)
             now = time.time()
-            logger.append(ep, obs.as_vector(), act, now)
+
+            # Append to the episode buffer. We append every tick from episode start (teleop included)
+            # UNTIL the grasp is detected (buffer_grasp_locked=True), at which point we stop. The
+            # auto sequence keeps running for the place phase but those frames are NOT recorded
+            # because the place is hardcoded -- nothing for the policy to learn there.
+            if not buffer_grasp_locked:
+                step_img = None
+                if renderer is not None:
+                    try:
+                        renderer.update_scene(env.data, camera=args.image_camera)
+                        step_img = renderer.render()  # (H, W, 3) uint8
+                    except Exception as exc:  # noqa: BLE001
+                        # Render failures shouldn't kill the data collection loop.
+                        if not getattr(args, "_img_warn_emitted", False):
+                            print(f"[IMG] WARNING: render failed ({exc!r}); dropping image stream.")
+                            args._img_warn_emitted = True  # type: ignore[attr-defined]
+                        renderer = None
+                buffer.append(obs.as_vector(), act, now, img=step_img)
+                lift = env.object_lift_height()
+                if lift > buffer.peak_lift_m:
+                    buffer.peak_lift_m = lift
+                if env.is_object_grasped(min_lift_m=args.success_lift):
+                    buffer.success = True
+                    buffer_grasp_locked = True
+                    print(
+                        f"[REC ] Grasp confirmed at step {len(buffer)} "
+                        f"(lift={buffer.peak_lift_m:.3f}m). Recording stopped; "
+                        f"the rest of the auto sequence will play but is not saved."
+                    )
+
+            if auto_seq is not None and done:
+                # Sequence finished. Persist the buffer if grasp succeeded; discard otherwise.
+                final_success = buffer.success
+                if final_success or args.save_failures:
+                    name = logger_episode_name(args.episode_name, attempts)
+                    written_name = buffer.commit(logger, name=name)
+                    saved += 1
+                    tag = "SAVED" if final_success else "SAVED(FAIL)"
+                    print(
+                        f"[AUTO #{attempts}] {tag} -> {written_name}  "
+                        f"steps={len(buffer)}  peak_lift={buffer.peak_lift_m:.3f}m  success={final_success}"
+                    )
+                else:
+                    discarded += 1
+                    print(
+                        f"[AUTO #{attempts}] DISCARDED (no successful grasp)  "
+                        f"steps={len(buffer)}  peak_lift={buffer.peak_lift_m:.3f}m"
+                    )
+                auto_seq = None
+
+                if args.reset_between_attempts:
+                    home_seed += 1
+                    obs = env.reset(seed=home_seed)
+                    home_xy = obs.ee_pos[:2].astype(np.float32).copy()
+                    print(
+                        f"[ENV] Reset for next attempt. obj_xy=({obs.obj_pos[0]:.3f},{obs.obj_pos[1]:.3f})  "
+                        f"saved={saved}  discarded={discarded}  attempts={attempts}"
+                    )
+
+                # Fresh buffer for the next episode. Recording resumes on the very next tick so
+                # the teleop approach phase is captured for the upcoming attempt as well.
+                buffer = EpisodeBuffer(
+                    image_camera=args.image_camera if renderer is not None else None,
+                )
+                buffer_grasp_locked = False
 
             if viewer is not None:
                 viewer.sync()
@@ -337,9 +579,9 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                 else:
                     pinch = "PINCH" if signal.g > 0.5 else "OPEN"
                     if auto_seq is not None:
-                        hud = f"{cmd_txt} | hand {pinch} | AUTO:{auto_seq.phase_name}"
+                        hud = f"{cmd_txt} | hand {pinch} | AUTO:{auto_seq.phase_name} lift={env.object_lift_height():.3f}"
                     else:
-                        hud = f"{cmd_txt} | hand {pinch}"
+                        hud = f"{cmd_txt} | hand {pinch} | saved={saved} disc={discarded}"
                 cv2.putText(vis, hud, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
                 try:
                     cv2.imshow("Webcam (teleop)", vis)
@@ -359,7 +601,7 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
                     cmd_txt = _format_cmd(float(act[0]), float(act[1]), float(act[2]), (args.delta_scale, args.delta_scale))
                     base = (
                         f"{cmd_txt} | pinch={pinch_label} | sim_grip_open={float(obs.gripper_open[0]):.3f} | "
-                        f"|obj-goal|={obj_to_goal:.2f}m"
+                        f"|obj-goal|={obj_to_goal:.2f}m | lift={env.object_lift_height():+.3f}m"
                     )
                     if args.verbose_numbers:
                         base += (
@@ -378,10 +620,37 @@ def run_loop(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Na
 
             time.sleep(env.model.opt.timestep)
     finally:
+        # If we were mid-episode when the loop ended, persist only if grasp was already confirmed.
+        # An in-flight buffer with no grasp yet (e.g. user was still teleoperating) is just dropped.
+        if len(buffer) > 0 and buffer.success:
+            name = logger_episode_name(args.episode_name, max(attempts, 1))
+            written_name = buffer.commit(logger, name=name)
+            saved += 1
+            print(f"[AUTO #{max(attempts, 1)}] (on exit) SAVED -> {written_name}  success=True")
+        elif len(buffer) > 0 and args.save_failures:
+            name = logger_episode_name(args.episode_name, max(attempts, 1))
+            written_name = buffer.commit(logger, name=name)
+            saved += 1
+            print(f"[AUTO #{max(attempts, 1)}] (on exit) SAVED(FAIL) -> {written_name}")
+        elif len(buffer) > 0:
+            discarded += 1
+            print(f"[AUTO #{max(attempts, 1)}] (on exit) DISCARDED (no successful grasp; {len(buffer)} steps)")
+
+        print(
+            f"[SUMMARY] attempts={attempts}  saved={saved}  discarded={discarded}  "
+            f"dataset={Path(args.dataset).expanduser().resolve()}"
+        )
         cap.release()
         extractor.close()
         if args.preview:
             cv2.destroyAllWindows()
+
+
+def logger_episode_name(base_name: Optional[str], attempt_idx: int) -> Optional[str]:
+    """Return a per-attempt episode name. If user provided --episode-name, suffix with attempt idx."""
+    if base_name is None:
+        return None
+    return f"{base_name}_a{attempt_idx:03d}"
 
 
 def main() -> None:
