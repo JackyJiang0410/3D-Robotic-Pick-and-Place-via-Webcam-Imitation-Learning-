@@ -17,7 +17,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate EgoVerse-style BC policy in MuJoCo.")
     p.add_argument("--viewer", action="store_true")
     p.add_argument("--policy", type=str, default="data/policies/egoverse_bc_policy.pt")
-    p.add_argument("--seconds", type=float, default=30.0)
+    p.add_argument(
+        "--session-num",
+        type=int,
+        default=10,
+        help="Number of evaluation sessions (reset cube + home arm each session; end after scripted post-pinch or failure).",
+    )
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--image-camera", type=str, default="agent_view")
     p.add_argument("--device", type=str, default="auto", help="auto|cpu|mps|cuda")
@@ -85,7 +90,62 @@ def parse_args() -> argparse.Namespace:
         default=0.015,
         help="Minimum grasp target z above table top.",
     )
+    p.add_argument(
+        "--spawn-x-range",
+        type=str,
+        default="0.45,0.65",
+        help='Cube spawn X range in meters as "lo,hi" (world depth strip, right side of workspace).',
+    )
+    p.add_argument(
+        "--spawn-y-range",
+        type=str,
+        default="0.06,0.10",
+        help='Cube spawn Y range in meters as "lo,hi" (narrow strip to the right of base centerline).',
+    )
+    p.add_argument(
+        "--frozen-min-steps",
+        type=int,
+        default=30,
+        help="Minimum sim steps before declaring a frozen (no-motion) failure during approach only.",
+    )
+    p.add_argument(
+        "--frozen-path-threshold",
+        type=float,
+        default=0.005,
+        help="If cumulative EE path length stays below this (m) after frozen-min-steps (approach only), abort session.",
+    )
+    p.add_argument(
+        "--frozen-min-dist-xy",
+        type=float,
+        default=0.06,
+        help="Only treat as frozen if ||ee_xy-obj_xy|| exceeds this (m); avoids aborting while nearly aligned above cube.",
+    )
+    p.add_argument(
+        "--session-max-steps",
+        type=int,
+        default=30_000,
+        help="Safety cap on sim steps per session if scripted phase never completes.",
+    )
+    p.add_argument(
+        "--stall-step-eps",
+        type=float,
+        default=1e-4,
+        help="If per-step TCP motion is below this (m) for many consecutive steps while far from cube, count as stall.",
+    )
+    p.add_argument(
+        "--stall-consecutive",
+        type=int,
+        default=150,
+        help="Consecutive sub-threshold steps (see --stall-step-eps) to abort approach as stuck.",
+    )
     return p.parse_args()
+
+
+def _parse_range(s: str, name: str) -> tuple[float, float]:
+    parts = s.replace(" ", "").split(",")
+    if len(parts) != 2:
+        raise ValueError(f"Bad --{name} {s!r}; expected 'lo,hi' like '0.45,0.65'.")
+    return float(parts[0]), float(parts[1])
 
 
 def choose_device(name: str) -> torch.device:
@@ -226,103 +286,194 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
 
         renderer = mujoco.Renderer(env.model, height=128, width=128)
 
-    obs = env.reset(seed=args.seed)
-    home_xy = obs.ee_pos[:2].astype(np.float32).copy()
-    end = time.time() + float(args.seconds)
-    last_print = 0.0
-    near_count = 0
-    auto_seq: Optional[AutoPickPlaceSequence] = None
+    n_sessions = max(1, int(args.session_num))
+    stats = {
+        "scripted_complete": 0,
+        "grasp_success": 0,
+        "frozen": 0,
+        "stalled": 0,
+        "timeout": 0,
+    }
 
-    while time.time() < end:
-        if auto_seq is not None:
-            act, done = auto_seq.step(env, time.time())
-            if done:
-                print("[AUTO] Post-pinch scripted sequence completed; returning to policy control.")
-                auto_seq = None
-        else:
-            obs_vec = obs.as_vector().astype(np.float32)
-            obs_norm = ((obs_vec - obs_mean) / obs_std).astype(np.float32)
-            obs_t = torch.from_numpy(obs_norm).to(device).unsqueeze(0)
+    for si in range(n_sessions):
+        seed = int(args.seed) + si * 100_003
+        obs = env.reset(seed=seed)
+        home_xy = obs.ee_pos[:2].astype(np.float32).copy()
+        ox, oy = float(obs.obj_pos[0]), float(obs.obj_pos[1])
+        print(
+            f"\n[SESSION {si + 1}/{n_sessions}] seed={seed}  cube_xy=({ox:.3f},{oy:.3f})  "
+            f"spawn_x={env.spawn_range[0]}  spawn_y={env.spawn_range[1]}"
+        )
 
-            img_t = None
-            if use_images:
-                renderer.update_scene(env.data, camera=args.image_camera)
-                img = renderer.render().astype(np.float32) / 255.0  # HWC
-                img_t = torch.from_numpy(img).to(device).permute(2, 0, 1).unsqueeze(0)
+        last_print = 0.0
+        near_count = 0
+        auto_seq: Optional[AutoPickPlaceSequence] = None
+        step_idx = 0
+        path_accum = 0.0
+        prev_ee = obs.ee_pos.astype(np.float32).copy()
+        stall_count = 0
+        scripted_finished = False
 
-            with torch.no_grad():
-                act = model(obs_t, img_t).squeeze(0).cpu().numpy().astype(np.float32)
-
-            # For this hybrid controller we only learn approach motion; gripper
-            # closure/opening is scripted in the post-trigger routine.
-            act[2] = 0.0
-            act[:2] *= float(args.act_scale_xy)
-            act[:2] = np.clip(act[:2], -float(args.act_max_xy), float(args.act_max_xy))
-            dead = float(args.act_deadband_xy)
-            act[0] = 0.0 if abs(float(act[0])) < dead else float(act[0])
-            act[1] = 0.0 if abs(float(act[1])) < dead else float(act[1])
-
-            ee_xy = obs.ee_pos[:2].astype(np.float32)
-            obj_xy = obs.obj_pos[:2].astype(np.float32)
-            dist_xy = float(np.linalg.norm(ee_xy - obj_xy))
-            if dist_xy <= float(args.trigger_distance):
-                near_count += 1
+        while True:
+            if auto_seq is not None:
+                act, done = auto_seq.step(env, time.time())
+                if done:
+                    print("[AUTO] Post-pinch scripted sequence completed.")
+                    auto_seq = None
+                    scripted_finished = True
             else:
-                near_count = 0
+                obs_vec = obs.as_vector().astype(np.float32)
+                obs_norm = ((obs_vec - obs_mean) / obs_std).astype(np.float32)
+                obs_t = torch.from_numpy(obs_norm).to(device).unsqueeze(0)
 
-            if near_count >= int(args.trigger_dwell_steps):
-                ws_min, ws_max = env.workspace_bounds
-                ee_t = env.ee_target
-                pre_xyz = ee_t.copy()
-                hover_z = float(ee_t[2])
-                if args.snap_to_cube:
-                    snap_xy = np.clip(obs.obj_pos[:2].astype(np.float32), ws_min[:2], ws_max[:2])
-                    pre_xyz[0] = float(snap_xy[0])
-                    pre_xyz[1] = float(snap_xy[1])
-                    env.set_ee_target(pre_xyz)
-                table_safe_z = float(args.auto_table_top_z + args.auto_table_clearance_z)
-                grasp_z = float(
-                    np.clip(
-                        max(obs.obj_pos[2] + float(args.auto_grasp_offset), table_safe_z),
-                        ws_min[2] + 0.03,
-                        ws_max[2] - 0.05,
+                img_t = None
+                if use_images:
+                    assert renderer is not None
+                    renderer.update_scene(env.data, camera=args.image_camera)
+                    img = renderer.render().astype(np.float32) / 255.0  # HWC
+                    img_t = torch.from_numpy(img).to(device).permute(2, 0, 1).unsqueeze(0)
+
+                with torch.no_grad():
+                    act = model(obs_t, img_t).squeeze(0).cpu().numpy().astype(np.float32)
+
+                # For this hybrid controller we only learn approach motion; gripper
+                # closure/opening is scripted in the post-trigger routine.
+                act[2] = 0.0
+                act[:2] *= float(args.act_scale_xy)
+                act[:2] = np.clip(act[:2], -float(args.act_max_xy), float(args.act_max_xy))
+                dead = float(args.act_deadband_xy)
+                act[0] = 0.0 if abs(float(act[0])) < dead else float(act[0])
+                act[1] = 0.0 if abs(float(act[1])) < dead else float(act[1])
+
+                ee_xy = obs.ee_pos[:2].astype(np.float32)
+                obj_xy = obs.obj_pos[:2].astype(np.float32)
+                dist_xy = float(np.linalg.norm(ee_xy - obj_xy))
+                if dist_xy <= float(args.trigger_distance):
+                    near_count += 1
+                else:
+                    near_count = 0
+
+                if near_count >= int(args.trigger_dwell_steps):
+                    ws_min, ws_max = env.workspace_bounds
+                    ee_t = env.ee_target
+                    pre_xyz = ee_t.copy()
+                    hover_z = float(ee_t[2])
+                    if args.snap_to_cube:
+                        snap_xy = np.clip(obs.obj_pos[:2].astype(np.float32), ws_min[:2], ws_max[:2])
+                        pre_xyz[0] = float(snap_xy[0])
+                        pre_xyz[1] = float(snap_xy[1])
+                        env.set_ee_target(pre_xyz)
+                    table_safe_z = float(args.auto_table_top_z + args.auto_table_clearance_z)
+                    grasp_z = float(
+                        np.clip(
+                            max(obs.obj_pos[2] + float(args.auto_grasp_offset), table_safe_z),
+                            ws_min[2] + 0.03,
+                            ws_max[2] - 0.05,
+                        )
                     )
-                )
-                lift_z = float(np.clip(max(hover_z, grasp_z) + 0.12, ws_min[2] + 0.05, ws_max[2] - 0.02))
-                auto_seq = AutoPickPlaceSequence(
-                    start_t=time.time(),
-                    pre_xyz=pre_xyz,
-                    pre_hover_z=hover_z,
-                    home_xy=home_xy,
-                    grasp_z=grasp_z,
-                    lift_z=lift_z,
-                    place_z=grasp_z,
-                    time_scale=float(args.auto_time_scale),
-                    ease_mode=str(args.auto_ease),
-                )
+                    lift_z = float(np.clip(max(hover_z, grasp_z) + 0.12, ws_min[2] + 0.05, ws_max[2] - 0.02))
+                    auto_seq = AutoPickPlaceSequence(
+                        start_t=time.time(),
+                        pre_xyz=pre_xyz,
+                        pre_hover_z=hover_z,
+                        home_xy=home_xy,
+                        grasp_z=grasp_z,
+                        lift_z=lift_z,
+                        place_z=grasp_z,
+                        time_scale=float(args.auto_time_scale),
+                        ease_mode=str(args.auto_ease),
+                    )
+                    print(
+                        "[AUTO] Triggered by proximity; running scripted post-pinch sequence "
+                        f"(dist_xy={dist_xy:.3f}m, grasp_z={grasp_z:.3f}, lift_z={lift_z:.3f})."
+                    )
+                    act, _ = auto_seq.step(env, time.time())
+                    near_count = 0
+
+            obs = env.step(act)
+            step_idx += 1
+            step_move = float(np.linalg.norm(obs.ee_pos.astype(np.float32) - prev_ee))
+            path_accum += step_move
+            if step_move < float(args.stall_step_eps):
+                stall_count += 1
+            else:
+                stall_count = 0
+            prev_ee = obs.ee_pos.astype(np.float32).copy()
+
+            if viewer is not None:
+                viewer.sync()
+
+            now = time.time()
+            if now - last_print > 0.5:
+                dist_xy_now = float(np.linalg.norm(obs.ee_pos[:2] - obs.obj_pos[:2]))
+                print(f"ctrl={act} | dist_xy={dist_xy_now:.4f}m | near_count={near_count} | step={step_idx}")
+                last_print = now
+            time.sleep(env.model.opt.timestep)
+
+            if scripted_finished:
+                grasped = env.is_object_grasped()
+                stats["scripted_complete"] += 1
+                if grasped:
+                    stats["grasp_success"] += 1
                 print(
-                    "[AUTO] Triggered by proximity; running scripted post-pinch sequence "
-                    f"(dist_xy={dist_xy:.3f}m, grasp_z={grasp_z:.3f}, lift_z={lift_z:.3f})."
+                    f"[SESSION {si + 1}/{n_sessions}] done  grasp_heuristic={grasped}  "
+                    f"path_accum={path_accum:.4f}m  steps={step_idx}"
                 )
-                act, _ = auto_seq.step(env, time.time())
-                near_count = 0
+                break
 
-        obs = env.step(act)
+            if step_idx >= int(args.session_max_steps):
+                stats["timeout"] += 1
+                print(
+                    f"[SESSION {si + 1}/{n_sessions}] TIMEOUT (steps>={args.session_max_steps}); "
+                    "starting next session."
+                )
+                break
 
-        if viewer is not None:
-            viewer.sync()
+            # (1) Frozen-from-start: cumulative path never exceeded threshold (never really moved),
+            #     while still far in XY. This misses "moved a bit then stuck" — see (2).
+            # (2) Stalled: many consecutive steps with microscopic TCP motion (policy/output stuck,
+            #     contact, or joint limit) while still far in XY. Catches the long constant-ctrl
+            #     case where path_accum is already > frozen-path-threshold.
+            dist_xy_post = float(np.linalg.norm(obs.ee_pos[:2] - obs.obj_pos[:2]))
+            if auto_seq is None and dist_xy_post > float(args.frozen_min_dist_xy):
+                if (
+                    step_idx >= int(args.frozen_min_steps)
+                    and path_accum < float(args.frozen_path_threshold)
+                ):
+                    stats["frozen"] += 1
+                    print(
+                        f"[SESSION {si + 1}/{n_sessions}] FROZEN (path_accum={path_accum:.5f}m "
+                        f"< {args.frozen_path_threshold}, dist_xy={dist_xy_post:.3f}m "
+                        f"after {step_idx} steps); starting next session."
+                    )
+                    break
+                if stall_count >= int(args.stall_consecutive):
+                    stats["stalled"] += 1
+                    print(
+                        f"[SESSION {si + 1}/{n_sessions}] STALLED (TCP motion < {args.stall_step_eps}m for "
+                        f"{stall_count} consecutive steps, dist_xy={dist_xy_post:.3f}m, "
+                        f"path_accum={path_accum:.4f}m); starting next session."
+                    )
+                    break
 
-        now = time.time()
-        if now - last_print > 0.5:
-            dist_xy_now = float(np.linalg.norm(obs.ee_pos[:2] - obs.obj_pos[:2]))
-            print(f"ctrl={act} | dist_xy={dist_xy_now:.4f}m | near_count={near_count}")
-            last_print = now
-        time.sleep(env.model.opt.timestep)
+    print(
+        "\n[EVAL SUMMARY] "
+        f"sessions={n_sessions}  scripted_complete={stats['scripted_complete']}  "
+        f"grasp_success={stats['grasp_success']}  frozen={stats['frozen']}  stalled={stats['stalled']}  "
+        f"timeout={stats['timeout']}"
+    )
 
 
 def main() -> None:
     args = parse_args()
-    env = PandaPickPlaceEnv()
+    spawn_x = _parse_range(args.spawn_x_range, "spawn-x-range")
+    spawn_y = _parse_range(args.spawn_y_range, "spawn-y-range")
+    env = PandaPickPlaceEnv(spawn_x_range=spawn_x, spawn_y_range=spawn_y)
+    (sx_lo, sx_hi), (sy_lo, sy_hi) = env.spawn_range
+    print(
+        f"[ENV] Cube spawn rectangle: x in [{sx_lo:.3f}, {sx_hi:.3f}] m, "
+        f"y in [{sy_lo:.3f}, {sy_hi:.3f}] m (clipped to workspace)."
+    )
 
     if not args.viewer:
         run(env, None, args)

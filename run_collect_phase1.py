@@ -139,7 +139,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--spawn-x-range",
         type=str,
-        default="0.40,0.70",
+        default="0.45,0.65",
         help=(
             "Uniform spawn range for the cube along world X (depth from robot base), "
             "as 'lo,hi' in meters. Default covers the long axis of the red spawn strip."
@@ -148,7 +148,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--spawn-y-range",
         type=str,
-        default="0.04,0.12",
+        default="0.06,0.10",
         help=(
             "Uniform spawn range for the cube along world Y (left/right), "
             "as 'lo,hi' in meters. Default is a narrow strip matching the red rectangle."
@@ -161,7 +161,7 @@ def _parse_range(s: str, name: str) -> tuple[float, float]:
     """Parse a 'lo,hi' string into a (lo, hi) float tuple."""
     parts = s.replace(" ", "").split(",")
     if len(parts) != 2:
-        raise ValueError(f"Bad --{name} {s!r}; expected 'lo,hi' like '0.40,0.70'.")
+        raise ValueError(f"Bad --{name} {s!r}; expected 'lo,hi' like '0.45,0.65'.")
     return float(parts[0]), float(parts[1])
 
 

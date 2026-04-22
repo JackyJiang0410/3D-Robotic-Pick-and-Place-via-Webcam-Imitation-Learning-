@@ -46,7 +46,7 @@
          so it does NOT fall/bounce at startup.
          condim=4 + non-zero torsional friction makes the pinch grasp stable; mass is set explicitly so the
          small position-controlled gripper can lift it without slipping. -->
-    <body name="object" pos="0.55 0.08 0.325">
+    <body name="object" pos="0.67 0.14 0.325">
       <freejoint name="object"/>
       <!-- Very stiff contact (1 ms time-constant, near-perfect impedance) makes the cube behave like
            a hard rigid body so the gripper pads cannot penetrate it. The grip is held by FRICTION, not

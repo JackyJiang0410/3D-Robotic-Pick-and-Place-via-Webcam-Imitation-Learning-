@@ -131,13 +131,13 @@ Quit the OpenCV preview window with `q`.
 
 The cube is spawned uniformly at random within an axis-aligned rectangle in world XY at each `env.reset()`. The rectangle is set via CLI flags and is automatically clipped to the arm workspace.
 
-- `--spawn-x-range` — `"lo,hi"` in meters along world **X** (depth, away from the robot base). Default `0.40,0.70` (a ~30 cm strip).
-- `--spawn-y-range` — `"lo,hi"` in meters along world **Y** (left/right). Default `0.04,0.12` (a narrow ~8 cm strip).
+- `--spawn-x-range` — `"lo,hi"` in meters along world **X** (depth, away from the robot base). Default `0.45,0.65` (a ~20 cm strip).
+- `--spawn-y-range` — `"lo,hi"` in meters along world **Y** (left/right). Default `0.06,0.10` (a narrow ~4 cm strip).
 
 At startup the effective rectangle is printed (after workspace clipping), e.g.:
 
 ```
-[ENV] Cube spawn rectangle: x in [0.400, 0.700] m, y in [0.040, 0.120] m (clipped to workspace).
+[ENV] Cube spawn rectangle: x in [0.450, 0.650] m, y in [0.060, 0.100] m (clipped to workspace).
 ```
 
 Example — collect with a wider spawn rectangle:
@@ -219,9 +219,11 @@ Evaluate the EgoVerse-style checkpoint:
 python .venv/bin/mjpython run_eval_egoverse_phase1.py \
   --viewer \
   --policy data/policies/egoverse_bc_policy.pt \
-  --seconds 30 \
+  --session-num 10 \
   --image-camera agent_view
 ```
+
+Each session resets the arm to the `home` keyframe and respawns the cube uniformly in XY (defaults: `x ∈ [0.45, 0.65]`, `y ∈ [0.06, 0.10]` m). The policy runs until either a proximity-triggered scripted pick-place finishes, the arm is deemed frozen (no meaningful motion while still far from the cube), or `--session-max-steps` is hit.
 
 ---
 

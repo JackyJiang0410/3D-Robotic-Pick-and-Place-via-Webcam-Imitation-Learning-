@@ -59,8 +59,10 @@ class PandaPickPlaceEnv:
         workspace_min: tuple[float, float, float] = (0.25, -0.35, 0.15),
         workspace_max: tuple[float, float, float] = (0.85, 0.35, 0.75),
         fingertip_local_offset: tuple[float, float, float] = (0.0, 0.0, 0.045),
-        spawn_x_range: tuple[float, float] = (0.40, 0.70),
-        spawn_y_range: tuple[float, float] = (0.04, 0.12),
+        # Default strip: somewhat smaller than the full table region; centered on the
+        # "right" workspace (post-reset EE from the home keyframe is near ~x=0.55, y≈0).
+        spawn_x_range: tuple[float, float] = (0.45, 0.65),
+        spawn_y_range: tuple[float, float] = (0.06, 0.10),
     ):
         self.model_path = Path(model_path) if model_path else DEFAULT_PANDA_SCENE
         self.model = mujoco.MjModel.from_xml_path(str(self.model_path))
