@@ -34,12 +34,9 @@ htmlcov/
 .vscode/
 .idea/
 
-# Local model/data artifacts
-data/
+# Local datasets only (policies under data/policies/ can be committed)
+data/datasets/
 stage1_sensory_input/models/
-*.zarr
-*.zarr.zip
-*.npz
 
 # Local vendored downloads / temp
 assets/_vendor/

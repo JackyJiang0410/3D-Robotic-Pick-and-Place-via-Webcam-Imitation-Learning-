@@ -52,7 +52,7 @@ Stream gestures to a JSONL file:
 python run_stage1.py --out data/datasets/stage1.jsonl --max-seconds 30
 ```
 
-`data/` is gitignored.
+`data/datasets/` is gitignored; `data/policies/` is not (you can commit checkpoints if you want).
 
 ---
 
@@ -255,7 +255,7 @@ robotics_2d_test/
 │   └── robots/mujoco_menagerie/franka_emika_panda/   # vendored MJCF + meshes
 ├── data/
 │   ├── datasets/                 # gitignored — zarr/jsonl data
-│   └── policies/                 # gitignored — trained checkpoints
+│   └── policies/                 # optional to commit — trained checkpoints
 ├── requirements.txt
 └── README.md
 ```
@@ -275,4 +275,4 @@ robotics_2d_test/
 
 ## Notes on data versioning
 
-Zarr datasets can be large, especially with `--save-images`. They live under `data/` which is gitignored. If you intentionally want to version a small reference dataset, use Git LFS rather than committing the raw arrays.
+Zarr datasets can be large, especially with `--save-images`. They live under `data/datasets/`, which is gitignored. If you intentionally want to version a small reference dataset, use Git LFS rather than committing the raw arrays. Policy files under `data/policies/` are not ignored by default.
