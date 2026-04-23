@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -103,22 +104,17 @@ def parse_args() -> argparse.Namespace:
         help='Cube spawn Y range in meters as "lo,hi" (narrow strip to the right of base centerline).',
     )
     p.add_argument(
-        "--frozen-min-steps",
+        "--no-progress-window",
         type=int,
-        default=30,
-        help="Minimum sim steps before declaring a frozen (no-motion) failure during approach only.",
+        default=100,
+        help="During approach, if sum of TCP motion over this many recent steps is below "
+        "--no-progress-path-min (m), abort session (rolling window, not from t=0).",
     )
     p.add_argument(
-        "--frozen-path-threshold",
+        "--no-progress-path-min",
         type=float,
-        default=0.005,
-        help="If cumulative EE path length stays below this (m) after frozen-min-steps (approach only), abort session.",
-    )
-    p.add_argument(
-        "--frozen-min-dist-xy",
-        type=float,
-        default=0.06,
-        help="Only treat as frozen if ||ee_xy-obj_xy|| exceeds this (m); avoids aborting while nearly aligned above cube.",
+        default=0.003,
+        help="Minimum rolling-window TCP path sum (meters) required; else session fails as no-progress.",
     )
     p.add_argument(
         "--session-max-steps",
@@ -136,7 +132,20 @@ def parse_args() -> argparse.Namespace:
         "--stall-consecutive",
         type=int,
         default=150,
-        help="Consecutive sub-threshold steps (see --stall-step-eps) to abort approach as stuck.",
+        help="Consecutive sub-threshold steps (see --stall-step-eps) to abort approach as stuck "
+        "(only while dist_xy > --trigger-distance).",
+    )
+    p.add_argument(
+        "--success-lift",
+        type=float,
+        default=0.05,
+        help="Lift threshold (m above reset rest height) used for grasp success counting.",
+    )
+    p.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Optional output folder (e.g. Results/run_001) to save eval logs.",
     )
     return p.parse_args()
 
@@ -276,9 +285,17 @@ class AutoPickPlaceSequence:
 
 
 def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespace) -> None:
+    log_lines: list[str] = []
+
+    def log(msg: str) -> None:
+        print(msg)
+        log_lines.append(msg)
+
     device = choose_device(args.device)
     model, obs_mean, obs_std, use_images = load_policy(Path(args.policy).expanduser().resolve(), device)
-    print(f"Loaded policy: {args.policy} (use_images={use_images})")
+    log(f"Loaded policy: {args.policy} (use_images={use_images})")
+    (sx_lo, sx_hi), (sy_lo, sy_hi) = env.spawn_range
+    log(f"[ENV] Cube spawn rectangle: x in [{sx_lo:.3f}, {sx_hi:.3f}] m, y in [{sy_lo:.3f}, {sy_hi:.3f}] m.")
 
     renderer = None
     if use_images:
@@ -290,7 +307,7 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
     stats = {
         "scripted_complete": 0,
         "grasp_success": 0,
-        "frozen": 0,
+        "no_progress": 0,
         "stalled": 0,
         "timeout": 0,
     }
@@ -300,7 +317,7 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
         obs = env.reset(seed=seed)
         home_xy = obs.ee_pos[:2].astype(np.float32).copy()
         ox, oy = float(obs.obj_pos[0]), float(obs.obj_pos[1])
-        print(
+        log(
             f"\n[SESSION {si + 1}/{n_sessions}] seed={seed}  cube_xy=({ox:.3f},{oy:.3f})  "
             f"spawn_x={env.spawn_range[0]}  spawn_y={env.spawn_range[1]}"
         )
@@ -313,12 +330,14 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
         prev_ee = obs.ee_pos.astype(np.float32).copy()
         stall_count = 0
         scripted_finished = False
+        session_ever_grasped = False
+        move_window: deque[float] = deque(maxlen=max(1, int(args.no_progress_window)))
 
         while True:
             if auto_seq is not None:
                 act, done = auto_seq.step(env, time.time())
                 if done:
-                    print("[AUTO] Post-pinch scripted sequence completed.")
+                    log("[AUTO] Post-pinch scripted sequence completed.")
                     auto_seq = None
                     scripted_finished = True
             else:
@@ -383,7 +402,7 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
                         time_scale=float(args.auto_time_scale),
                         ease_mode=str(args.auto_ease),
                     )
-                    print(
+                    log(
                         "[AUTO] Triggered by proximity; running scripted post-pinch sequence "
                         f"(dist_xy={dist_xy:.3f}m, grasp_z={grasp_z:.3f}, lift_z={lift_z:.3f})."
                     )
@@ -392,8 +411,11 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
 
             obs = env.step(act)
             step_idx += 1
+            if env.is_object_grasped(min_lift_m=float(args.success_lift)):
+                session_ever_grasped = True
             step_move = float(np.linalg.norm(obs.ee_pos.astype(np.float32) - prev_ee))
             path_accum += step_move
+            move_window.append(step_move)
             if step_move < float(args.stall_step_eps):
                 stall_count += 1
             else:
@@ -406,62 +428,77 @@ def run(env: PandaPickPlaceEnv, viewer: Optional[object], args: argparse.Namespa
             now = time.time()
             if now - last_print > 0.5:
                 dist_xy_now = float(np.linalg.norm(obs.ee_pos[:2] - obs.obj_pos[:2]))
-                print(f"ctrl={act} | dist_xy={dist_xy_now:.4f}m | near_count={near_count} | step={step_idx}")
+                log(f"ctrl={act} | dist_xy={dist_xy_now:.4f}m | near_count={near_count} | step={step_idx}")
                 last_print = now
             time.sleep(env.model.opt.timestep)
 
             if scripted_finished:
-                grasped = env.is_object_grasped()
                 stats["scripted_complete"] += 1
-                if grasped:
+                if session_ever_grasped:
                     stats["grasp_success"] += 1
-                print(
-                    f"[SESSION {si + 1}/{n_sessions}] done  grasp_heuristic={grasped}  "
+                log(
+                    f"[SESSION {si + 1}/{n_sessions}] done  grasp_success={session_ever_grasped}  "
                     f"path_accum={path_accum:.4f}m  steps={step_idx}"
                 )
                 break
 
             if step_idx >= int(args.session_max_steps):
                 stats["timeout"] += 1
-                print(
+                log(
                     f"[SESSION {si + 1}/{n_sessions}] TIMEOUT (steps>={args.session_max_steps}); "
                     "starting next session."
                 )
                 break
 
-            # (1) Frozen-from-start: cumulative path never exceeded threshold (never really moved),
-            #     while still far in XY. This misses "moved a bit then stuck" — see (2).
-            # (2) Stalled: many consecutive steps with microscopic TCP motion (policy/output stuck,
-            #     contact, or joint limit) while still far in XY. Catches the long constant-ctrl
-            #     case where path_accum is already > frozen-path-threshold.
             dist_xy_post = float(np.linalg.norm(obs.ee_pos[:2] - obs.obj_pos[:2]))
-            if auto_seq is None and dist_xy_post > float(args.frozen_min_dist_xy):
-                if (
-                    step_idx >= int(args.frozen_min_steps)
-                    and path_accum < float(args.frozen_path_threshold)
-                ):
-                    stats["frozen"] += 1
-                    print(
-                        f"[SESSION {si + 1}/{n_sessions}] FROZEN (path_accum={path_accum:.5f}m "
-                        f"< {args.frozen_path_threshold}, dist_xy={dist_xy_post:.3f}m "
-                        f"after {step_idx} steps); starting next session."
-                    )
-                    break
-                if stall_count >= int(args.stall_consecutive):
-                    stats["stalled"] += 1
-                    print(
-                        f"[SESSION {si + 1}/{n_sessions}] STALLED (TCP motion < {args.stall_step_eps}m for "
-                        f"{stall_count} consecutive steps, dist_xy={dist_xy_post:.3f}m, "
-                        f"path_accum={path_accum:.4f}m); starting next session."
-                    )
-                    break
+            # Approach-only failure: still outside proximity trigger band, but TCP barely moves
+            # over a *recent* window (fixes "stuck just outside trigger" with near-zero rolling motion).
+            if (
+                auto_seq is None
+                and len(move_window) >= int(args.no_progress_window)
+                and float(sum(move_window)) < float(args.no_progress_path_min)
+                and dist_xy_post > float(args.trigger_distance)
+            ):
+                stats["no_progress"] += 1
+                win_sum = float(sum(move_window))
+                log(
+                    f"[SESSION {si + 1}/{n_sessions}] NO_PROGRESS (last {args.no_progress_window} steps TCP path "
+                    f"sum={win_sum:.5f}m < {args.no_progress_path_min}, dist_xy={dist_xy_post:.4f}m "
+                    f"> trigger={args.trigger_distance}); starting next session."
+                )
+                break
+            if (
+                auto_seq is None
+                and dist_xy_post > float(args.trigger_distance)
+                and stall_count >= int(args.stall_consecutive)
+            ):
+                stats["stalled"] += 1
+                log(
+                    f"[SESSION {si + 1}/{n_sessions}] STALLED (TCP motion < {args.stall_step_eps}m for "
+                    f"{stall_count} consecutive steps, dist_xy={dist_xy_post:.3f}m, "
+                    f"path_accum={path_accum:.4f}m); starting next session."
+                )
+                break
 
-    print(
-        "\n[EVAL SUMMARY] "
+    summary_line = (
+        "[EVAL SUMMARY] "
         f"sessions={n_sessions}  scripted_complete={stats['scripted_complete']}  "
-        f"grasp_success={stats['grasp_success']}  frozen={stats['frozen']}  stalled={stats['stalled']}  "
+        f"grasp_success={stats['grasp_success']}  no_progress={stats['no_progress']}  stalled={stats['stalled']}  "
         f"timeout={stats['timeout']}"
     )
+    log(f"\n{summary_line}")
+
+    if args.output:
+        out_dir = Path(args.output).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_file = out_dir / "eval.log"
+        with out_file.open("w", encoding="utf-8") as f:
+            f.write(summary_line + "\n\n")
+            for line in log_lines:
+                if line.strip() == summary_line.strip():
+                    continue
+                f.write(line + "\n")
+        print(f"[LOG] Saved evaluation log to: {out_file}")
 
 
 def main() -> None:
@@ -469,11 +506,6 @@ def main() -> None:
     spawn_x = _parse_range(args.spawn_x_range, "spawn-x-range")
     spawn_y = _parse_range(args.spawn_y_range, "spawn-y-range")
     env = PandaPickPlaceEnv(spawn_x_range=spawn_x, spawn_y_range=spawn_y)
-    (sx_lo, sx_hi), (sy_lo, sy_hi) = env.spawn_range
-    print(
-        f"[ENV] Cube spawn rectangle: x in [{sx_lo:.3f}, {sx_hi:.3f}] m, "
-        f"y in [{sy_lo:.3f}, {sy_hi:.3f}] m (clipped to workspace)."
-    )
 
     if not args.viewer:
         run(env, None, args)

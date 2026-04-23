@@ -5,6 +5,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import csv
 
 import numpy as np
 import torch
@@ -19,6 +20,13 @@ class TrainBatch:
     obs: torch.Tensor
     act: torch.Tensor
     img: torch.Tensor | None
+
+
+@dataclass
+class EpisodeData:
+    obs: np.ndarray
+    act: np.ndarray
+    img: np.ndarray | None
 
 
 class EgoVerseStyleBC(nn.Module):
@@ -79,6 +87,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-split", type=float, default=0.1)
     p.add_argument("--obs-only", action="store_true", help="Ignore img even if available in dataset.")
     p.add_argument("--keep-failures", action="store_true", help="Include episodes with success=false.")
+    p.add_argument(
+        "--val-split-by-episode",
+        action="store_true",
+        default=True,
+        help="Split train/val by whole episodes (prevents timestep leakage across splits).",
+    )
+    p.add_argument(
+        "--no-val-split-by-episode",
+        dest="val_split_by_episode",
+        action="store_false",
+        help="Use random timestep split instead of episode split.",
+    )
+    p.add_argument(
+        "--history-csv",
+        type=str,
+        default="data/policies/egoverse_train_history.csv",
+        help="Where to save per-epoch train/val metrics CSV.",
+    )
+    p.add_argument(
+        "--history-plot",
+        type=str,
+        default="data/policies/egoverse_train_history.png",
+        help="Where to save train/val metric plot (requires matplotlib).",
+    )
     return p.parse_args()
 
 
@@ -92,12 +124,10 @@ def choose_device(name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_dataset(path: Path, obs_only: bool, keep_failures: bool):
+def load_dataset_episodes(path: Path, obs_only: bool, keep_failures: bool):
     root = zarr.open_group(str(path), mode="r")
     eps = root["episodes"]
-    obs_list: list[np.ndarray] = []
-    act_list: list[np.ndarray] = []
-    img_list: list[np.ndarray] = []
+    episodes: list[EpisodeData] = []
     use_images = False
     for k in sorted(eps.group_keys()):
         g = eps[k]
@@ -109,29 +139,42 @@ def load_dataset(path: Path, obs_only: bool, keep_failures: bool):
         n = min(obs.shape[0], act.shape[0])
         if n <= 0:
             continue
-        obs_list.append(obs[:n])
-        act_list.append(act[:n])
+        ep_obs = obs[:n]
+        ep_act = act[:n]
+        ep_img = None
         if (not obs_only) and ("img" in g):
-            img = np.asarray(g["img"], dtype=np.uint8)[:n]
-            img_list.append(img)
+            ep_img = np.asarray(g["img"], dtype=np.uint8)[:n]
             use_images = True
 
-    if not obs_list:
+        finite = np.isfinite(ep_obs).all(axis=1) & np.isfinite(ep_act).all(axis=1)
+        ep_obs = ep_obs[finite]
+        ep_act = ep_act[finite]
+        if ep_img is not None:
+            ep_img = ep_img[finite]
+        if ep_obs.shape[0] <= 0:
+            continue
+
+        episodes.append(EpisodeData(obs=ep_obs, act=ep_act, img=ep_img))
+
+    if not episodes:
         raise RuntimeError(f"No usable episodes found in {path}")
 
-    X_obs = np.concatenate(obs_list, axis=0)
-    Y_act = np.concatenate(act_list, axis=0)
-    finite = np.isfinite(X_obs).all(axis=1) & np.isfinite(Y_act).all(axis=1)
-    X_obs = X_obs[finite]
-    Y_act = Y_act[finite]
+    if use_images:
+        use_images = all(ep.img is not None for ep in episodes)
+        if not use_images:
+            for ep in episodes:
+                ep.img = None
+    return episodes, use_images
 
-    X_img = None
-    if use_images and len(img_list) == len(obs_list):
-        X_img = np.concatenate(img_list, axis=0)[finite]
+
+def _concat_episodes(episodes: list[EpisodeData], use_images: bool):
+    obs = np.concatenate([ep.obs for ep in episodes], axis=0)
+    act = np.concatenate([ep.act for ep in episodes], axis=0)
+    if use_images:
+        img = np.concatenate([ep.img for ep in episodes if ep.img is not None], axis=0)
     else:
-        use_images = False
-
-    return X_obs, Y_act, X_img, use_images
+        img = None
+    return obs, act, img
 
 
 def make_batches(
@@ -167,34 +210,44 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     device = choose_device(args.device)
 
-    X_obs, Y_act, X_img, use_images = load_dataset(dataset_path, args.obs_only, args.keep_failures)
-    n = X_obs.shape[0]
-    obs_dim = X_obs.shape[1]
-    act_dim = Y_act.shape[1]
-    print(f"Loaded {n} samples from {dataset_path}")
+    episodes, use_images = load_dataset_episodes(dataset_path, args.obs_only, args.keep_failures)
+    ep_count = len(episodes)
+    total_n = int(sum(ep.obs.shape[0] for ep in episodes))
+    obs_dim = episodes[0].obs.shape[1]
+    act_dim = episodes[0].act.shape[1]
+    print(f"Loaded {total_n} samples from {dataset_path} ({ep_count} episodes)")
     print(f"obs_dim={obs_dim} act_dim={act_dim} use_images={use_images}")
 
-    obs_mean = X_obs.mean(axis=0).astype(np.float32)
-    obs_std = X_obs.std(axis=0).astype(np.float32)
+    all_obs, _, _ = _concat_episodes(episodes, use_images=False)
+    obs_mean = all_obs.mean(axis=0).astype(np.float32)
+    obs_std = all_obs.std(axis=0).astype(np.float32)
     obs_std[obs_std < 1e-6] = 1.0
-    Xn = ((X_obs - obs_mean) / obs_std).astype(np.float32)
 
-    val_n = max(1, int(n * float(args.val_split)))
-    perm = np.random.permutation(n)
-    val_idx = perm[:val_n]
-    tr_idx = perm[val_n:]
-    tr_obs, tr_act = Xn[tr_idx], Y_act[tr_idx]
-    va_obs, va_act = Xn[val_idx], Y_act[val_idx]
-    tr_img = X_img[tr_idx] if X_img is not None else None
-    va_img = X_img[val_idx] if X_img is not None else None
+    if args.val_split_by_episode:
+        val_ep_n = min(max(1, int(ep_count * float(args.val_split))), max(1, ep_count - 1))
+        perm_ep = np.random.permutation(ep_count)
+        va_ep_idx = set(perm_ep[:val_ep_n].tolist())
+        tr_eps = [ep for i, ep in enumerate(episodes) if i not in va_ep_idx]
+        va_eps = [ep for i, ep in enumerate(episodes) if i in va_ep_idx]
+    else:
+        tr_eps = episodes
+        va_eps = episodes
+
+    tr_obs_raw, tr_act, tr_img = _concat_episodes(tr_eps, use_images=use_images)
+    va_obs_raw, va_act, va_img = _concat_episodes(va_eps, use_images=use_images)
+    tr_obs = ((tr_obs_raw - obs_mean) / obs_std).astype(np.float32)
+    va_obs = ((va_obs_raw - obs_mean) / obs_std).astype(np.float32)
+    print(f"Split: train_samples={tr_obs.shape[0]} val_samples={va_obs.shape[0]} val_by_episode={args.val_split_by_episode}")
 
     model = EgoVerseStyleBC(obs_dim=obs_dim, act_dim=act_dim, use_images=use_images).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     train_start = time.time()
+    history: list[dict[str, float]] = []
 
     for epoch in range(1, int(args.epochs) + 1):
         model.train()
         train_loss = 0.0
+        train_mae = 0.0
         train_steps = 0
         train_total = max(1, (tr_obs.shape[0] + int(args.batch_size) - 1) // int(args.batch_size))
         train_bar = tqdm(
@@ -207,16 +260,19 @@ def main() -> None:
         for batch in train_bar:
             pred = model(batch.obs, batch.img)
             loss = F.mse_loss(pred, batch.act)
+            mae = F.l1_loss(pred, batch.act)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             train_loss += float(loss.item())
+            train_mae += float(mae.item())
             train_steps += 1
             train_bar.set_postfix(loss=f"{float(loss.item()):.5f}")
 
         model.eval()
         with torch.no_grad():
             val_loss = 0.0
+            val_mae = 0.0
             val_steps = 0
             val_total = max(1, (va_obs.shape[0] + int(args.batch_size) - 1) // int(args.batch_size))
             val_bar = tqdm(
@@ -229,19 +285,66 @@ def main() -> None:
             for batch in val_bar:
                 pred = model(batch.obs, batch.img)
                 loss = F.mse_loss(pred, batch.act)
+                mae = F.l1_loss(pred, batch.act)
                 val_loss += float(loss.item())
+                val_mae += float(mae.item())
                 val_steps += 1
                 val_bar.set_postfix(loss=f"{float(loss.item()):.5f}")
 
         train_loss /= max(train_steps, 1)
+        train_mae /= max(train_steps, 1)
         val_loss /= max(val_steps, 1)
+        val_mae /= max(val_steps, 1)
         elapsed = time.time() - train_start
         avg_epoch = elapsed / epoch
         eta = avg_epoch * (int(args.epochs) - epoch)
+        history.append(
+            {
+                "epoch": float(epoch),
+                "train_mse": train_loss,
+                "val_mse": val_loss,
+                "train_mae": train_mae,
+                "val_mae": val_mae,
+            }
+        )
         print(
             f"epoch {epoch:03d} | train_mse={train_loss:.6f} | val_mse={val_loss:.6f} | "
+            f"train_mae={train_mae:.6f} | val_mae={val_mae:.6f} | "
             f"elapsed={elapsed:.1f}s | eta={eta:.1f}s"
         )
+
+    history_csv = Path(args.history_csv).expanduser().resolve()
+    history_csv.parent.mkdir(parents=True, exist_ok=True)
+    with history_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["epoch", "train_mse", "val_mse", "train_mae", "val_mae"])
+        writer.writeheader()
+        for row in history:
+            writer.writerow(row)
+    print(f"Saved training history CSV to: {history_csv}")
+
+    history_plot = Path(args.history_plot).expanduser().resolve()
+    history_plot.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        xs = [row["epoch"] for row in history]
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].plot(xs, [row["train_mse"] for row in history], label="train_mse")
+        axes[0].plot(xs, [row["val_mse"] for row in history], label="val_mse")
+        axes[0].set_title("MSE")
+        axes[0].set_xlabel("epoch")
+        axes[0].legend()
+        axes[1].plot(xs, [row["train_mae"] for row in history], label="train_mae")
+        axes[1].plot(xs, [row["val_mae"] for row in history], label="val_mae")
+        axes[1].set_title("MAE")
+        axes[1].set_xlabel("epoch")
+        axes[1].legend()
+        fig.tight_layout()
+        fig.savefig(history_plot, dpi=160)
+        plt.close(fig)
+        print(f"Saved training history plot to: {history_plot}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] Could not write history plot ({exc!r}). Install matplotlib to enable PNG plots.")
 
     payload = {
         "state_dict": model.state_dict(),
@@ -250,7 +353,7 @@ def main() -> None:
         "obs_dim": obs_dim,
         "act_dim": act_dim,
         "use_images": use_images,
-        "image_shape": tuple(X_img.shape[1:]) if X_img is not None else None,
+        "image_shape": tuple(episodes[0].img.shape[1:]) if (use_images and episodes[0].img is not None) else None,
         "dataset": str(dataset_path),
     }
     torch.save(payload, out_path)

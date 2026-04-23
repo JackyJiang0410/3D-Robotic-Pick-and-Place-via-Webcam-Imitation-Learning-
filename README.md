@@ -223,7 +223,7 @@ python .venv/bin/mjpython run_eval_egoverse_phase1.py \
   --image-camera agent_view
 ```
 
-Each session resets the arm to the `home` keyframe and respawns the cube uniformly in XY (defaults: `x ∈ [0.45, 0.65]`, `y ∈ [0.06, 0.10]` m). The policy runs until either a proximity-triggered scripted pick-place finishes, the arm is deemed frozen (no meaningful motion while still far from the cube), or `--session-max-steps` is hit.
+Each session resets the arm to the `home` keyframe and respawns the cube uniformly in XY (defaults: `x ∈ [0.45, 0.65]`, `y ∈ [0.06, 0.10]` m). The policy runs until either a proximity-triggered scripted pick-place finishes, a **rolling-window no-progress** check fails (too little TCP motion over the last `--no-progress-window` steps while still outside `--trigger-distance`), a micro-motion stall fires, or `--session-max-steps` is hit.
 
 ---
 

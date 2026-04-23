@@ -1,0 +1,26 @@
+{
+  "zarr": "/Users/haojiang/Desktop/CS 395T/CS395T_Project/data/datasets/phase1_vision.zarr",
+  "episodes": 17,
+  "total_steps": 6635,
+  "obs_dim": 41,
+  "act_dim": 3,
+  "successes": 17,
+  "episode_length": {
+    "min": 22,
+    "max": 965,
+    "mean": 390.29411764705884,
+    "median": 361.0
+  },
+  "idle_xy_frac": 0.055011303692539565,
+  "pinch_frac": 0.0,
+  "dist_xyz_m": {
+    "p50": 0.2159378081560135,
+    "p95": 0.3317933678627014
+  },
+  "image_camera_counts": {
+    "agent_view": 17
+  },
+  "image_shape_counts": {
+    "(128, 128, 3)": 17
+  }
+}
